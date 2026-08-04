@@ -1,0 +1,4 @@
+﻿symbol,captured_at_taipei,source_market_time,price,source_url
+WTX&,2026-07-29 08:47:57 +08:00,2026-07-29 08:47:00 +08:00,41922,https://tw.stock.yahoo.com/future/WTX&
+WTX&,2026-07-29 08:58:19 +08:00,2026-07-29 08:58:00 +08:00,41765,https://tw.stock.yahoo.com/future/WTX&
+WTX&,2026-07-29 10:00:11 +08:00,2026-07-29 10:00:00 +08:00,40587,https://tw.stock.yahoo.com/future/WTX&

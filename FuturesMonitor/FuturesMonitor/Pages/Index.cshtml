@@ -1,0 +1,175 @@
+@page
+@model IndexModel
+@{
+    ViewData["Title"] = "即時儀表板";
+}
+
+<div class="dashboard" data-dashboard data-endpoint="/api/dashboard" data-refresh-ms="3000">
+    <section class="dashboard-header">
+        <div>
+            <p class="eyebrow">FuturesMonitor</p>
+            <h1>台指期即時監控</h1>
+        </div>
+        <div class="connection-pill" data-field="connection">
+            <span class="status-dot"></span>
+            <span data-field="connectionText">連線中</span>
+        </div>
+    </section>
+
+    <section class="quote-panel" aria-live="polite">
+        <canvas class="quote-chart" data-field="quoteChart" aria-hidden="true"></canvas>
+        <div class="quote-main">
+            <div>
+                <span class="field-label">即時期貨點數</span>
+                <div class="price-row">
+                    <span class="price" data-field="price">--</span>
+                    <span class="price-change" data-field="priceChange">--</span>
+                </div>
+                <small class="comparison-note" data-field="comparisonBase">比較基準：--</small>
+            </div>
+            <span class="symbol-chip" data-field="symbol">WTX&amp;</span>
+        </div>
+        <div class="quote-grid">
+            <div>
+                <span class="field-label">市場時間</span>
+                <strong data-field="sampleTime">--</strong>
+            </div>
+            <div>
+                <span class="field-label">擷取時間</span>
+                <strong data-field="capturedAt">--</strong>
+            </div>
+            <div>
+                <span class="field-label">資料年齡</span>
+                <strong data-field="age">--</strong>
+            </div>
+            <div>
+                <span class="field-label">最後刷新</span>
+                <strong data-field="lastRefresh">--</strong>
+            </div>
+        </div>
+    </section>
+
+    <section class="event-console" data-recommendation aria-live="polite">
+        <header class="event-console-header">
+            <div>
+                <span class="field-label">SMA76 Trigger Event</span>
+                <h2>目前入場建議</h2>
+            </div>
+            <div class="event-badges">
+                <strong class="event-side" data-field="recommendationSide">--</strong>
+                <strong class="recommendation-status" data-field="recommendationStatus">尚無事件</strong>
+            </div>
+        </header>
+        <div class="trigger-strip">
+            <span class="trigger-light" data-field="triggerLight"></span>
+            <strong data-field="triggerRule">等待 15分K 突破／跌破 SMA76</strong>
+            <span data-field="triggerTime">--</span>
+        </div>
+        <div class="event-price-grid">
+            <div class="event-price event-price-entry">
+                <span class="field-label">建議入場區間</span>
+                <strong data-field="entryRange">--</strong>
+            </div>
+            <div class="event-price event-price-stop">
+                <span class="field-label">停損價</span>
+                <strong data-field="stopLoss">--</strong>
+            </div>
+            <div class="event-price event-price-take">
+                <span class="field-label">停利價</span>
+                <strong data-field="takeProfit">--</strong>
+            </div>
+            <div class="event-price">
+                <span class="field-label">報酬風險比</span>
+                <strong data-field="rewardRisk">--</strong>
+            </div>
+        </div>
+        <div class="event-meta-grid">
+            <div>
+                <span class="field-label">參考事件</span>
+                <strong data-field="referenceEvent">--</strong>
+            </div>
+            <div>
+                <span class="field-label">ATR 比率</span>
+                <strong data-field="atrRatio">--</strong>
+            </div>
+            <div>
+                <span class="field-label">實際入場</span>
+                <strong data-field="enteredPrice">--</strong>
+            </div>
+            <div>
+                <span class="field-label">結果信心</span>
+                <strong data-field="confidence">--</strong>
+            </div>
+            <div>
+                <span class="field-label">入場觸價率</span>
+                <strong data-field="entryHitRate">--</strong>
+            </div>
+            <div>
+                <span class="field-label">事件結果</span>
+                <strong data-field="outcome">--</strong>
+            </div>
+        </div>
+    </section>
+
+    <section class="strategy-grid" aria-live="polite">
+        <article class="strategy-card strategy-card-long" data-context-side="long">
+            <header class="strategy-card-header">
+                <div>
+                    <span class="field-label">Market Context</span>
+                    <h2>多方盤勢參考</h2>
+                </div>
+                <strong class="context-state" data-field="contextState">--</strong>
+            </header>
+            <div class="strategy-meta">
+                <span data-field="status">--</span>
+                <span data-field="sampleTime">--</span>
+                <span data-field="consolidation">--</span>
+            </div>
+            <ul class="condition-list" data-field="conditions"></ul>
+        </article>
+
+        <article class="strategy-card strategy-card-short" data-context-side="short">
+            <header class="strategy-card-header">
+                <div>
+                    <span class="field-label">Market Context</span>
+                    <h2>空方盤勢參考</h2>
+                </div>
+                <strong class="context-state" data-field="contextState">--</strong>
+            </header>
+            <div class="strategy-meta">
+                <span data-field="status">--</span>
+                <span data-field="sampleTime">--</span>
+                <span data-field="consolidation">--</span>
+            </div>
+            <ul class="condition-list" data-field="conditions"></ul>
+        </article>
+    </section>
+
+    <section class="history-panel" aria-live="polite">
+        <header class="history-header">
+            <div>
+                <span class="field-label">Recommendation Log</span>
+                <h2>歷史建議紀錄</h2>
+            </div>
+            <strong class="history-count" data-field="historyCount">0 筆</strong>
+        </header>
+        <div class="history-grid">
+            <article class="history-lane history-lane-long" data-history-side="long">
+                <header class="history-lane-header">
+                    <span class="field-label">Long</span>
+                    <h3>多方紀錄</h3>
+                </header>
+                <div class="history-list" data-field="historyList"></div>
+            </article>
+            <article class="history-lane history-lane-short" data-history-side="short">
+                <header class="history-lane-header">
+                    <span class="field-label">Short</span>
+                    <h3>空方紀錄</h3>
+                </header>
+                <div class="history-list" data-field="historyList"></div>
+            </article>
+        </div>
+    </section>
+
+    <p class="dashboard-message" data-field="message" hidden></p>
+</div>

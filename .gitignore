@@ -1,0 +1,65 @@
+# Build output
+**/bin/
+**/obj/
+**/Debug/
+**/Release/
+**/publish/
+**/publish-*/
+**/PubTmp/
+**/artifacts/
+**/.verify/
+
+# IDE and user-local files
+.vs/
+.vscode/
+.idea/
+.claude/
+.dotnet-cli/
+**/.dotnet-cli/
+*.user
+*.suo
+*.rsuser
+*.csproj.user
+**/Properties/PublishProfiles/*.pubxml
+**/Properties/PublishProfiles/*.pubxml.user
+
+# Secrets and local configuration
+**/appsettings.json
+**/appsettings.*.json
+!**/appsettings.example.json
+*.env
+.env.*
+!.env.example
+secrets.*
+credentials.*
+*.pfx
+*.p12
+*.pem
+*.key
+
+# Logs and runtime files
+**/logs/
+**/file/logs/
+*.log
+*.tmp
+*.temp
+*cloudflare*
+*ngrok*
+*tunnel*
+
+# Local media, downloaded tools, and generated data
+**/TestFile/
+**/tools/*.exe
+**/tools/*.dll
+**/tools/*.pdb
+**/sbk_tablelayout_chunks/
+**/sbk_tablelayout_chunks_v2/
+
+# Package caches
+node_modules/
+packages/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store

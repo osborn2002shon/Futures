@@ -1,0 +1,8 @@
+{
+  "Telegram": {
+    "BotToken": "",
+    "ChatId": "-1002632222356",
+    "DashboardUrl": "https://futuresmonitor.cjhwork.com/",
+    "SendStartupTestMessage": true
+  }
+}

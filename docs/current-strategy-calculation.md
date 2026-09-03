@@ -3,7 +3,7 @@
 ## 1. 文件定位
 
 - 文件狀態：目前程式實際行為。
-- 最後核對日期：2026-07-31。
+- 最後核對日期：2026-08-05。
 - 適用專案：`FuturesBot`、`FuturesMonitor`。
 - 本文件用來協助後續除錯、調參、回測與重構。
 - 如果本文件與需求規格不同：
@@ -22,8 +22,8 @@
 - 向上突破產生 `long` 事件。
 - 向下跌破產生 `short` 事件。
 - 事件型態目前固定為 `reversal`。
-- 舊有多空各 6 個策略條件仍每分鐘計算，但只供人類判讀盤勢。
-- 6 個條件的符合數不會觸發、阻止、取消或修改自動建議。
+- 舊有多空各 7 個策略條件仍每分鐘計算，但只供人類判讀盤勢。
+- 7 個條件的符合數不會觸發、阻止、取消或修改自動建議。
 - 找到合格的舊事件時，使用該事件觸發後的 5 分 K 計算入場區間、停損與停利。
 - 找不到舊事件時仍保存本次觸發，但不報價格。
 - 同一商品同一時間最多一筆 `waiting_entry` 或 `entered` 建議。
@@ -105,7 +105,7 @@ BarEnd <= SampleTime
 
 ## 5. 人類盤勢參考條件
 
-盤勢參考由 `EntryStrategyEvaluator` 計算，多方與空方各 6 個條件。
+盤勢參考由 `EntryStrategyEvaluator` 計算，多方與空方各 7 個條件。
 
 ### 5.1 參數
 
@@ -127,18 +127,20 @@ BarEnd <= SampleTime
 1. 前一根 Close 在 SMA76 下方，最新 Close 在 SMA76 上方。
 2. 最新 SMA76 大於 5 根前 SMA76。
 3. 最新 SMA20 大於 5 根前 SMA20。
-4. SMA20 大於 SMA76。
-5. 目前不屬於盤整。
-6. 最新 1 分 K Close 大於 1 分 K SMA60。
+4. 最新 15 分 K Close 大於該根 SMA20。
+5. SMA20 大於 SMA76。
+6. 目前不屬於盤整。
+7. 最新 1 分 K Close 大於 1 分 K SMA60。
 
 ### 5.3 空方條件
 
 1. 前一根 Close 在 SMA76 上方，最新 Close 在 SMA76 下方。
 2. 最新 SMA76 小於 5 根前 SMA76。
 3. 最新 SMA20 小於 5 根前 SMA20。
-4. SMA20 小於 SMA76。
-5. 目前不屬於盤整。
-6. 最新 1 分 K Close 小於 1 分 K SMA60。
+4. 最新 15 分 K Close 小於該根 SMA20。
+5. SMA20 小於 SMA76。
+6. 目前不屬於盤整。
+7. 最新 1 分 K Close 小於 1 分 K SMA60。
 
 ### 5.4 盤整判斷
 
@@ -298,7 +300,7 @@ AtrRatio =
 ```
 
 - 日盤與夜盤不分開搜尋，也不加權。
-- SMA20、均線方向、均線排列、盤整、1 分 SMA60 與 6 條件分數都不參與篩選。
+- SMA20、均線方向、均線排列、盤整、1 分 SMA60 與 7 條件分數都不參與篩選。
 
 ### 8.2 一個容易誤解的重要實作
 
@@ -309,7 +311,7 @@ AtrRatio =
 3. 如果該事件資料或映射價格不合格，再嘗試更舊的一筆。
 4. 第一筆成功產生有效價格結構的事件即成為 `ReferenceEventId`。
 
-因此 P25、P50、P90、P60 的樣本是單一參考事件中的 5 分 K 棒，不是多個歷史事件。
+因此 P25、P50、P70 的樣本是單一參考事件中的 5 分 K 棒，不是多個歷史事件。
 
 ### 8.3 目前對候選事件狀態的限制
 
@@ -410,17 +412,9 @@ Bar.High >= ReferenceEntryLow
 
 找不到觸價棒時，該候選參考事件無效，繼續尋找更舊事件。
 
-## 11. 停損與停利分布
+## 11. 停利分布與結構停損
 
 從參考事件的觸價棒開始，最多取 24 根 5 分 K。
-
-每根 K 棒的不利距離：
-
-```text
-Adverse =
-    long  => Max(0, ReferenceEntryMid - Low) / ReferenceAtr5
-    short => Max(0, High - ReferenceEntryMid) / ReferenceAtr5
-```
 
 每根 K 棒的有利距離：
 
@@ -433,11 +427,24 @@ Favorable =
 目前程式計算：
 
 ```text
-StopFactor       = P90(每根 K 棒的 Adverse)
-TakeProfitFactor = P60(每根 K 棒的 Favorable)
+TakeProfitFactor = P70(每根 K 棒的 Favorable)
 ```
 
-兩個因子都必須大於 0。
+`TakeProfitFactor` 必須大於 0。
+
+停損不再使用參考事件的 `Adverse` 百分位，而是使用目前觸發時的近期結構：
+
+```text
+StructureBars =
+    觸發前最多 12 根 5 分 K + 觸發所在 15 分 K 內的 5 分 K
+
+StopAnchor =
+    long  => 最近局部低點；找不到時取觸發區段最低 Low
+    short => 最近局部高點；找不到時取觸發區段最高 High
+
+StructureStopBuffer =
+    0.5 × CurrentAtr5
+```
 
 注意：目前是對追蹤區段內「每根 K 棒的 excursion」取百分位，不是先把整個事件濃縮成單一最大 MAE、最大 MFE 後，再跨多個事件計算百分位。
 
@@ -457,10 +464,18 @@ EntryHigh = Max(Round(MappedEntryA), Round(MappedEntryB))
 EntryMid  = (EntryLow + EntryHigh) / 2
 
 StopLoss =
-    Round(EntryMid - SideSign × StopFactor × CurrentAtr5)
+    long  => Round(Min(StopAnchor, CurrentSma76) - StructureStopBuffer)
+    short => Round(Max(StopAnchor, CurrentSma76) + StructureStopBuffer)
+
+HistoricalTakeProfit =
+    Round(EntryMid + SideSign × TakeProfitFactor × CurrentAtr5)
+
+MinimumRewardTakeProfit =
+    Round(EntryMid + SideSign × RiskPoints × 2.0)
 
 TakeProfit =
-    Round(EntryMid + SideSign × TakeProfitFactor × CurrentAtr5)
+    long  => Max(HistoricalTakeProfit, MinimumRewardTakeProfit)
+    short => Min(HistoricalTakeProfit, MinimumRewardTakeProfit)
 ```
 
 目前所有報價都四捨五入到整數點，並使用：
@@ -484,7 +499,7 @@ RewardRiskRatio =
 有效價格結構：
 
 ```text
-RewardRiskRatio >= 1.5
+RewardRiskRatio >= 2.0
 ```
 
 多方：
@@ -696,6 +711,7 @@ EntryHitRate =
 `EntryRecommendationEvents`：
 
 - 一筆代表一次 SMA76 觸發事件。
+- `RecommendationPrice` 保存建議建立當下的台指期點數；既有事件會以該事件 `EvaluatedAtTaipei` 之前最近一筆 `FuturesTicks` 回補。
 - 入場、停損、停利價格建立後不修改。
 - 只有狀態、有效旗標、入場資訊、完成資訊與 `ModifiedAtUtc` 會在轉換時更新。
 - `ReferenceEventId` 目前是邏輯上的自我參照，資料庫沒有外鍵。
@@ -707,6 +723,7 @@ EntryHitRate =
 - 每次狀態轉換新增一筆。
 - 以外鍵連到 `EntryRecommendationEvents.Id`。
 - 保存前一狀態、新狀態、觀察價格與中文說明。
+- 事件建立的第一筆歷程會以 `RecommendationPrice` 作為 `ObservedPrice`。
 
 ### 17.4 TXT
 
@@ -720,6 +737,7 @@ entry_recommendation_events.txt
 - 盤勢參考只在狀態鍵改變時追加。
 - 舊版 `strategy_score_15m.txt` 保留既有 SMA76 盤整指標歷史，不再追加新格式資料。
 - 建議只在事件新增或狀態轉換時追加。
+- 新追加的建議列會在尾欄輸出 `recommendation_price`。
 - 每分鐘沒有變化時不寫重複內容。
 
 ## 18. FutureMonitor 顯示
@@ -737,9 +755,10 @@ entry_recommendation_events.txt
   - R/R。
   - 參考事件與 ATR 比率。
   - 實際入場價與時間。
+  - 建議建立當下點數。
   - 信心快照、樣本數與入場觸價率。
   - 最終結果。
-- 6 個舊條件以多空盤勢燈號顯示，只供參考。
+- 7 個舊條件以多空盤勢燈號顯示，只供參考。
 
 ## 19. 參數修改入口
 
@@ -753,7 +772,7 @@ entry_recommendation_events.txt
 | 入場、停損、停利、逾期與取消 | [EntryRecommendation.cs](../FuturesBot/FuturesBot/EntryRecommendation.cs) 的 `RecommendationLifecycleEvaluator` |
 | 信心公式與 SQL 統計口徑 | [EntryRecommendationStore.cs](../FuturesBot/FuturesBot/EntryRecommendationStore.cs) 的 `LoadRecommendationConfidenceAsync` |
 | 事件與狀態歷程資料表 | [EntryRecommendationStore.cs](../FuturesBot/FuturesBot/EntryRecommendationStore.cs) |
-| 舊 6 條件、盤整與 1 分 SMA60 | [StrategyScoring.cs](../FuturesBot/FuturesBot/StrategyScoring.cs) |
+| 舊 7 條件、盤整與 1 分 SMA60 | [StrategyScoring.cs](../FuturesBot/FuturesBot/StrategyScoring.cs) |
 | 每分鐘執行順序 | [Program.cs](../FuturesBot/FuturesBot/Program.cs) 的 `TryEvaluateEntryStrategyAsync` |
 | K 棒聚合與寫入 | [SqlStores.cs](../FuturesBot/FuturesBot/SqlStores.cs) |
 | TXT 欄位 | [StrategyTextReporter.cs](../FuturesBot/FuturesBot/StrategyTextReporter.cs) |
@@ -776,7 +795,7 @@ entry_recommendation_events.txt
 
 ### 20.2 價格模型目前只用單一舊事件
 
-P25/P50/P90/P60 都來自一筆參考事件內的 K 棒分布，對單一行情路徑較敏感。
+P25/P50/P70 都來自一筆參考事件內的 K 棒分布，對單一行情路徑較敏感。
 
 後續可比較：
 
@@ -803,6 +822,7 @@ P25/P50/P90/P60 都來自一筆參考事件內的 K 棒分布，對單一行情�
 - 分鐘內快速碰到入場、停損或停利後又返回，可能完全沒被取樣。
 - 回測與即時結果都不能視為成交保證。
 - `EntryPrice` 是 Bot 首次觀察到的區間內價格，不是委託成交價。
+- `RecommendationPrice` 是建議建立當下的 Yahoo 樣本價格，不是入場或成交價。
 
 ### 20.5 交易日曆
 
@@ -835,7 +855,7 @@ P25/P50/P90/P60 都來自一筆參考事件內的 K 棒分布，對單一行情�
 3. 驗證 ATR 恰好 15 根 5 分 K 時可計算，14 根時資料不足。
 4. 驗證 ATR 比率邊界 `0.5`、`2.0` 可接受，超出時略過候選。
 5. 驗證 P25/P50 線性插值與整數點取整。
-6. 驗證多方與空方價格順序及 R/R `1.5` 邊界。
+6. 驗證多方與空方價格順序及 R/R `2.0` 邊界。
 7. 驗證反向觸發只取消 `waiting_entry`，不取消 `entered`。
 8. 驗證同一觸發棒不重複新增。
 9. 驗證同一商品不會同時存在兩筆 `IsActive = 1`。

@@ -24,7 +24,12 @@ httpClient.DefaultRequestHeaders.UserAgent.ParseAdd(options.UserAgent);
 httpClient.DefaultRequestHeaders.AcceptLanguage.ParseAdd("zh-TW,zh;q=0.9,en;q=0.6");
 
 var quoteClient = new YahooFuturesQuoteClient(httpClient, options);
-var store = options.DryRun && !options.InitDatabase
+var telegramNotifier = TelegramNotifier.Create(
+    httpClient,
+    options.TelegramBotToken,
+    options.TelegramChatId,
+    options.TelegramDashboardUrl);
+var store = options.DryRun && !options.InitDatabase && !options.RecalculateRecommendations
     ? null
     : await TryCreateSqlStoreAsync(options, taipeiTimeZone, shutdown.Token);
 
@@ -43,6 +48,9 @@ else if (!options.DryRun)
 Console.WriteLine($"Market hours filter: {(options.IgnoreMarketHours ? "off" : "on")}");
 Console.WriteLine($"Fetch timing: once per minute at +{options.FetchDelaySeconds}s after the minute closes");
 Console.WriteLine($"Text output: {options.DataDirectory}");
+WriteConfigStatus(options);
+WriteTelegramStatus(telegramNotifier, options);
+await TrySendStartupTestMessageAsync(telegramNotifier, options, taipeiTimeZone, shutdown.Token);
 
 if (options.InitDatabase)
 {
@@ -50,9 +58,26 @@ if (options.InitDatabase)
     return;
 }
 
+if (options.RecalculateRecommendations)
+{
+    if (store is null)
+    {
+        Console.WriteLine("Recommendation recalculation failed: database is unavailable.");
+        return;
+    }
+
+    var summary = await EntryRecommendationRecalculator.RecalculateAsync(store, shutdown.Token);
+    Console.WriteLine(
+        "Recommendation recalculation complete: " +
+        $"{summary.EventCount} events, {summary.UpdatedCount} rewritten, " +
+        $"{summary.PriceChangedCount} price changes, {summary.StatusChangedCount} status changes, " +
+        $"{summary.StatusHistoryRowsWritten} status history rows.");
+    return;
+}
+
 if (options.RunOnce || options.DryRun)
 {
-    await RunCollectionOnceAsync(quoteClient, store, strategyTextReporter, options, taipeiTimeZone, shutdown.Token);
+    await RunCollectionOnceAsync(quoteClient, store, strategyTextReporter, telegramNotifier, options, taipeiTimeZone, shutdown.Token);
     return;
 }
 
@@ -73,7 +98,7 @@ while (!shutdown.IsCancellationRequested)
             Console.WriteLine($"Database connected: {options.DatabaseDisplayName}");
         }
 
-        await RunCollectionOnceAsync(quoteClient, store, strategyTextReporter, options, taipeiTimeZone, shutdown.Token);
+        await RunCollectionOnceAsync(quoteClient, store, strategyTextReporter, telegramNotifier, options, taipeiTimeZone, shutdown.Token);
     }
     catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
     {
@@ -117,6 +142,7 @@ static async Task RunCollectionOnceAsync(
     YahooFuturesQuoteClient quoteClient,
     FuturesSqlStore? store,
     StrategyTextReporter strategyTextReporter,
+    TelegramNotifier? telegramNotifier,
     AppOptions options,
     TimeZoneInfo taipeiTimeZone,
     CancellationToken cancellationToken)
@@ -125,6 +151,16 @@ static async Task RunCollectionOnceAsync(
 
     try
     {
+        if (!options.DryRun && store is not null)
+        {
+            await TrySettleRecommendationAtNightCloseAsync(
+                capturedAt,
+                store,
+                strategyTextReporter,
+                telegramNotifier,
+                cancellationToken);
+        }
+
         if (!options.IgnoreMarketHours && !TaiwanFuturesMarketHours.IsCollectionTime(capturedAt.DateTime, options.FetchDelaySeconds))
         {
             Console.WriteLine($"{capturedAt:yyyy-MM-dd HH:mm:ss zzz} market closed; waiting.");
@@ -180,7 +216,7 @@ static async Task RunCollectionOnceAsync(
         }
 
         Console.WriteLine($"{point.CapturedAt:yyyy-MM-dd HH:mm:ss zzz} stored {point.Symbol} price={point.Price} yahooUpdatedAt={point.SourceMarketTime}");
-        await TryEvaluateEntryStrategyAsync(point, sqlStore, strategyTextReporter, cancellationToken);
+        await TryEvaluateEntryStrategyAsync(point, sqlStore, strategyTextReporter, telegramNotifier, cancellationToken);
     }
     catch (Exception ex) when (ex is not OperationCanceledException)
     {
@@ -194,10 +230,57 @@ static async Task RunCollectionOnceAsync(
 
 static string FormatDateTime(DateTimeOffset value) => value.ToString("yyyy-MM-dd HH:mm:ss zzz", CultureInfo.InvariantCulture);
 
+static async Task TrySettleRecommendationAtNightCloseAsync(
+    DateTimeOffset evaluatedAt,
+    FuturesSqlStore store,
+    StrategyTextReporter strategyTextReporter,
+    TelegramNotifier? telegramNotifier,
+    CancellationToken cancellationToken)
+{
+    var active = await store.LoadActiveRecommendationEventAsync(cancellationToken);
+    if (active is null)
+    {
+        return;
+    }
+
+    var nightClose = TaiwanFuturesMarketHours.GetTradingDayNightSessionEnd(active.TriggerAt);
+    if (nightClose is null || evaluatedAt < nightClose.Value)
+    {
+        return;
+    }
+
+    var changes = new List<RecommendationChange>();
+    await ApplyLifecycleTransitionsAsync(
+        active,
+        evaluatedAt,
+        store.GetTicksSnapshot(),
+        store.GetBarsSnapshot(5),
+        store,
+        changes,
+        cancellationToken);
+
+    if (changes.Count == 0)
+    {
+        return;
+    }
+
+    await strategyTextReporter.AppendRecommendationChangesAsync(changes, cancellationToken);
+    foreach (var change in changes)
+    {
+        WriteRecommendationChangeLine(change);
+    }
+
+    if (telegramNotifier is not null)
+    {
+        await telegramNotifier.SendRecommendationChangesAsync(changes, cancellationToken);
+    }
+}
+
 static async Task TryEvaluateEntryStrategyAsync(
     FuturesTick point,
     FuturesSqlStore store,
     StrategyTextReporter strategyTextReporter,
+    TelegramNotifier? telegramNotifier,
     CancellationToken cancellationToken)
 {
     var sampleMinute = MarketDataClock.GetSampleMinute(point);
@@ -239,51 +322,70 @@ static async Task TryEvaluateEntryStrategyAsync(
         scores);
     if (trigger is not null)
     {
-        if (active is not null
-            && active.Status == EntryRecommendationStatuses.WaitingEntry
-            && active.Side != trigger.Side)
-        {
-            var cancellation = RecommendationLifecycleEvaluator.CancelForOppositeTrigger(active, trigger);
-            var cancelledChange = await store.TryTransitionRecommendationAsync(active, cancellation, cancellationToken);
-            if (cancelledChange is not null)
-            {
-                changes.Add(cancelledChange);
-                active = null;
-            }
-        }
-
         var confidence = await store.LoadRecommendationConfidenceAsync(
             trigger.Side,
             trigger.EventType,
             cancellationToken);
         var previousEvents = await store.LoadRecommendationEventsAsync(500, cancellationToken);
-        var draft = active is null
-            ? EntryRecommendationPriceCalculator.Build(
-                trigger,
-                previousEvents,
-                fiveMinuteBars,
-                confidence)
-            : EntryRecommendationPriceCalculator.Suppressed(confidence);
-        var recommendation = EntryRecommendationEvent.FromDraft(trigger, draft);
-        var insertedChange = await store.TryInsertRecommendationEventAsync(
-            recommendation,
-            point.CapturedAt,
-            GetInitialRecommendationNote(draft.Status),
-            cancellationToken);
-        if (insertedChange is not null)
+        var draft = EntryRecommendationPriceCalculator.Build(
+            trigger,
+            previousEvents,
+            fiveMinuteBars,
+            confidence);
+        var shouldInsertRecommendation = true;
+
+        if (active is not null && EntryRecommendationStatuses.IsActive(draft.Status))
         {
-            changes.Add(insertedChange);
-            active = insertedChange.Recommendation.IsActive
-                ? insertedChange.Recommendation
-                : null;
-            active = await ApplyLifecycleTransitionsAsync(
-                active,
-                sampleMinute,
-                ticks,
-                fiveMinuteBars,
-                store,
-                changes,
+            if (IsSameRecommendationTrigger(active, trigger))
+            {
+                shouldInsertRecommendation = false;
+            }
+            else if (active.Status == EntryRecommendationStatuses.WaitingEntry
+                     && active.Side != trigger.Side)
+            {
+                var cancellation = RecommendationLifecycleEvaluator.CancelForOppositeTrigger(active, trigger);
+                var cancelledChange = await store.TryTransitionRecommendationAsync(active, cancellation, cancellationToken);
+                if (cancelledChange is not null)
+                {
+                    changes.Add(cancelledChange);
+                    active = null;
+                }
+                else
+                {
+                    active = await store.LoadActiveRecommendationEventAsync(cancellationToken);
+                }
+            }
+            else
+            {
+                draft = EntryRecommendationPriceCalculator.Suppressed(confidence);
+            }
+        }
+
+        if (shouldInsertRecommendation)
+        {
+            var recommendation = EntryRecommendationEvent.FromDraft(trigger, draft, point.Price);
+            var insertedChange = await store.TryInsertRecommendationEventAsync(
+                recommendation,
+                point.CapturedAt,
+                GetInitialRecommendationNote(draft.Status),
                 cancellationToken);
+            if (insertedChange is not null)
+            {
+                changes.Add(insertedChange);
+                if (insertedChange.Recommendation.IsActive)
+                {
+                    active = insertedChange.Recommendation;
+                }
+
+                active = await ApplyLifecycleTransitionsAsync(
+                    active,
+                    sampleMinute,
+                    ticks,
+                    fiveMinuteBars,
+                    store,
+                    changes,
+                    cancellationToken);
+            }
         }
     }
 
@@ -291,6 +393,11 @@ static async Task TryEvaluateEntryStrategyAsync(
     foreach (var change in changes)
     {
         WriteRecommendationChangeLine(change);
+    }
+
+    if (telegramNotifier is not null)
+    {
+        await telegramNotifier.SendRecommendationChangesAsync(changes, cancellationToken);
     }
 }
 
@@ -327,6 +434,12 @@ static async Task<EntryRecommendationEvent?> ApplyLifecycleTransitionsAsync(
 
     return active;
 }
+
+static bool IsSameRecommendationTrigger(EntryRecommendationEvent active, Sma76Trigger trigger) =>
+    active.Symbol == trigger.Symbol
+    && active.TriggerBarStart == trigger.TriggerBarStart
+    && active.Side == trigger.Side
+    && string.Equals(active.EventType, trigger.EventType, StringComparison.Ordinal);
 
 static string GetInitialRecommendationNote(string status) =>
     status switch
@@ -369,9 +482,12 @@ static void WriteRecommendationChangeLine(RecommendationChange change)
     WriteColored($"recommendation #{recommendation.Id} ", color);
     WriteColored($"{recommendation.Side.ToString().ToLowerInvariant()} ", color);
     WriteColored($"{change.PreviousStatus ?? "new"} -> {recommendation.Status} ", ConsoleColor.Yellow);
+    WriteColored($"recommendationPrice={FormatNullablePoint(recommendation.RecommendationPrice)} ", ConsoleColor.White);
     WriteColored($"entry={FormatRange(recommendation.EntryLow, recommendation.EntryHigh)} ", ConsoleColor.White);
     WriteColored($"stop={FormatNullablePoint(recommendation.StopLoss)} ", ConsoleColor.White);
     WriteColored($"take={FormatNullablePoint(recommendation.TakeProfit)} ", ConsoleColor.White);
+    WriteColored($"exit={FormatNullablePoint(recommendation.ExitPrice)} ", ConsoleColor.White);
+    WriteColored($"pnl={FormatNullableSignedPoint(recommendation.ProfitPoints)} ", ConsoleColor.White);
     WriteColored($"confidence={recommendation.ConfidenceStatus}/{recommendation.ConfidenceSampleCount}", ConsoleColor.DarkGray);
     Console.WriteLine();
 }
@@ -380,6 +496,11 @@ static string FormatRange(decimal? low, decimal? high) =>
     low is null || high is null ? "-" : $"{low:0}-{high:0}";
 
 static string FormatNullablePoint(decimal? value) => value?.ToString("0", CultureInfo.InvariantCulture) ?? "-";
+
+static string FormatNullableSignedPoint(decimal? value) =>
+    value is { } points
+        ? points.ToString(points > 0 ? "+0" : "0", CultureInfo.InvariantCulture)
+        : "-";
 
 static void WriteColored(string text, ConsoleColor color)
 {
@@ -408,12 +529,62 @@ static async Task DelayUntilNextMinuteCloseAsync(int fetchDelaySeconds, Cancella
     await Task.Delay(nextRunAt - now, cancellationToken);
 }
 
+static void WriteConfigStatus(AppOptions options)
+{
+    if (!string.IsNullOrWhiteSpace(options.ConfigLoadError))
+    {
+        Console.WriteLine($"Config file: error reading {options.ConfigFilePath}: {options.ConfigLoadError}");
+        return;
+    }
+
+    Console.WriteLine(string.IsNullOrWhiteSpace(options.ConfigFilePath)
+        ? "Config file: not found (futuresbot.config.json)"
+        : $"Config file: loaded {options.ConfigFilePath}");
+}
+
+static void WriteTelegramStatus(TelegramNotifier? telegramNotifier, AppOptions options)
+{
+    Console.WriteLine($"Telegram notifications: {(telegramNotifier is null ? "off" : "on")}");
+    Console.WriteLine($"Telegram bot token: {(string.IsNullOrWhiteSpace(options.TelegramBotToken) ? "missing" : "set")}");
+    Console.WriteLine($"Telegram chat id: {FormatConfiguredValue(options.TelegramChatId)}");
+    Console.WriteLine($"Telegram dashboard URL: {options.TelegramDashboardUrl}");
+    Console.WriteLine($"Telegram startup test: {(options.SendStartupTestMessage ? "on" : "off")}");
+
+    if (telegramNotifier is null)
+    {
+        Console.WriteLine("Telegram setup: missing bot token or chat id.");
+    }
+}
+
+static async Task TrySendStartupTestMessageAsync(
+    TelegramNotifier? telegramNotifier,
+    AppOptions options,
+    TimeZoneInfo taipeiTimeZone,
+    CancellationToken cancellationToken)
+{
+    if (!options.SendStartupTestMessage || telegramNotifier is null)
+    {
+        return;
+    }
+
+    Console.Write("Telegram startup test send: ");
+    var sent = await telegramNotifier.SendStartupTestMessageAsync(
+        options.Symbol,
+        TaipeiClock.Now(taipeiTimeZone),
+        cancellationToken);
+    Console.WriteLine(sent ? "sent." : "failed.");
+}
+
+static string FormatConfiguredValue(string? value) =>
+    string.IsNullOrWhiteSpace(value) ? "missing" : value;
+
 internal sealed record AppOptions(
     string Symbol,
     string QuoteUrl,
     bool RunOnce,
     bool DryRun,
     bool InitDatabase,
+    bool RecalculateRecommendations,
     bool IgnoreMarketHours,
     decimal MinimumValidPrice,
     int MaxQuoteAgeMinutes,
@@ -425,7 +596,13 @@ internal sealed record AppOptions(
     string SqlDatabase,
     string SqlUser,
     string SqlPassword,
-    string? SqlConnectionString)
+    string? SqlConnectionString,
+    string? TelegramBotToken,
+    string? TelegramChatId,
+    string TelegramDashboardUrl,
+    bool SendStartupTestMessage,
+    string? ConfigFilePath,
+    string? ConfigLoadError)
 {
     public string MasterConnectionString => BuildConnectionString("master");
 
@@ -442,11 +619,13 @@ internal sealed record AppOptions(
 
     public static AppOptions Parse(string[] args)
     {
+        var config = FuturesBotConfig.Load();
         var symbol = "WTX&";
         var quoteUrl = "https://tw.stock.yahoo.com/future/WTX&";
         var runOnce = false;
         var dryRun = false;
         var initDatabase = false;
+        var recalculateRecommendations = false;
         var ignoreMarketHours = false;
         var minimumValidPrice = 10_000m;
         var maxQuoteAgeMinutes = 10;
@@ -459,6 +638,24 @@ internal sealed record AppOptions(
         var sqlUser = "admin";
         var sqlPassword = "guitar";
         string? sqlConnectionString = null;
+        string? telegramBotToken = FirstConfigured(
+            Environment.GetEnvironmentVariable("FUTURESBOT_TELEGRAM_BOT_TOKEN"),
+            Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN"),
+            config.Telegram?.BotToken);
+        string? telegramChatId = FirstConfigured(
+            Environment.GetEnvironmentVariable("FUTURESBOT_TELEGRAM_CHAT_ID"),
+            Environment.GetEnvironmentVariable("TELEGRAM_CHAT_ID"),
+            config.Telegram?.ChatId);
+        var telegramDashboardUrl = FirstConfigured(
+            Environment.GetEnvironmentVariable("FUTURESBOT_TELEGRAM_DASHBOARD_URL"),
+            Environment.GetEnvironmentVariable("FUTURESBOT_DASHBOARD_URL"),
+            config.Telegram?.DashboardUrl)
+            ?? "https://futuresmonitor.cjhwork.com/";
+        var sendStartupTestMessage = FirstConfiguredBool(
+            false,
+            config.Telegram?.SendStartupTestMessage,
+            Environment.GetEnvironmentVariable("FUTURESBOT_TELEGRAM_STARTUP_TEST"),
+            Environment.GetEnvironmentVariable("FUTURESBOT_SEND_STARTUP_TEST_MESSAGE"));
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -483,6 +680,9 @@ internal sealed record AppOptions(
                     break;
                 case "--init-db":
                     initDatabase = true;
+                    break;
+                case "--recalculate-recommendations":
+                    recalculateRecommendations = true;
                     break;
                 case "--ignore-market-hours":
                     ignoreMarketHours = true;
@@ -517,6 +717,21 @@ internal sealed record AppOptions(
                 case "--connection-string":
                     sqlConnectionString = RequireValue(args, ref i, arg);
                     break;
+                case "--telegram-bot-token":
+                    telegramBotToken = RequireValue(args, ref i, arg);
+                    break;
+                case "--telegram-chat-id":
+                    telegramChatId = RequireValue(args, ref i, arg);
+                    break;
+                case "--telegram-dashboard-url":
+                    telegramDashboardUrl = RequireValue(args, ref i, arg);
+                    break;
+                case "--telegram-startup-test":
+                    sendStartupTestMessage = true;
+                    break;
+                case "--no-telegram-startup-test":
+                    sendStartupTestMessage = false;
+                    break;
                 case "--help":
                 case "-h":
                 case "/?":
@@ -534,6 +749,7 @@ internal sealed record AppOptions(
             runOnce,
             dryRun,
             initDatabase,
+            recalculateRecommendations,
             ignoreMarketHours,
             minimumValidPrice,
             maxQuoteAgeMinutes,
@@ -545,7 +761,13 @@ internal sealed record AppOptions(
             sqlDatabase,
             sqlUser,
             sqlPassword,
-            sqlConnectionString);
+            sqlConnectionString,
+            telegramBotToken,
+            telegramChatId,
+            telegramDashboardUrl,
+            sendStartupTestMessage,
+            config.LoadedPath,
+            config.LoadError);
     }
 
     private string BuildConnectionString(string databaseName)
@@ -589,6 +811,7 @@ internal sealed record AppOptions(
           --run-once                    Fetch once, write SQL records, then exit
           --dry-run                     Fetch once and print the parsed quote without writing SQL records
           --init-db                     Create or update the SQL database schema, then exit
+          --recalculate-recommendations Rebuild existing recommendation events with the current pricing logic, then exit
           --ignore-market-hours         Fetch even outside Taiwan futures trading hours
           --min-price <price>           Reject parsed prices below this value. Default: 10000
           --max-quote-age-minutes <n>   Skip writes if Yahoo update time is older than this. Default: 10
@@ -600,6 +823,11 @@ internal sealed record AppOptions(
           --sql-password <password>     SQL password. Default: guitar
           --connection-string <value>   Full SQL connection string. Database is still set from --sql-database.
           --data-dir <path>             Directory for changed strategy/recommendation text output. Default: data/yahoo-wtx
+          --telegram-bot-token <token>  Telegram bot token. Can also use config or FUTURESBOT_TELEGRAM_BOT_TOKEN.
+          --telegram-chat-id <chat-id>  Telegram channel/chat id. Can also use config or FUTURESBOT_TELEGRAM_CHAT_ID.
+          --telegram-dashboard-url <url> Dashboard URL in Telegram messages. Can also use config. Default: https://futuresmonitor.cjhwork.com/
+          --telegram-startup-test       Send a Telegram test message on startup.
+          --no-telegram-startup-test    Disable the Telegram startup test message.
           --help                        Show help
 
         Output tables:
@@ -610,6 +838,49 @@ internal sealed record AppOptions(
           dbo.EntryRecommendationStatusHistory
           dbo.FuturesErrorLogs
         """);
+    }
+
+    private static string? FirstConfigured(params string?[] values) =>
+        values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+
+    private static bool FirstConfiguredBool(bool defaultValue, bool? configValue, params string?[] values)
+    {
+        foreach (var value in values)
+        {
+            if (TryParseBool(value, out var parsed))
+            {
+                return parsed;
+            }
+        }
+
+        return configValue ?? defaultValue;
+    }
+
+    private static bool TryParseBool(string? value, out bool parsed)
+    {
+        if (bool.TryParse(value, out parsed))
+        {
+            return true;
+        }
+
+        switch (value?.Trim().ToLowerInvariant())
+        {
+            case "1":
+            case "yes":
+            case "y":
+            case "on":
+                parsed = true;
+                return true;
+            case "0":
+            case "no":
+            case "n":
+            case "off":
+                parsed = false;
+                return true;
+            default:
+                parsed = false;
+                return false;
+        }
     }
 }
 
@@ -971,6 +1242,20 @@ internal static class TaiwanFuturesMarketHours
         var sessionEnd = TimeOnly.FromDateTime(sessionStart.Value) == DayOpen
             ? DateOnly.FromDateTime(sessionStart.Value).ToDateTime(DayClose)
             : DateOnly.FromDateTime(sessionStart.Value).AddDays(1).ToDateTime(NightClose);
+        return new DateTimeOffset(sessionEnd, taipeiTime.Offset);
+    }
+
+    public static DateTimeOffset? GetTradingDayNightSessionEnd(DateTimeOffset taipeiTime)
+    {
+        var localTime = taipeiTime.DateTime;
+        var sessionStart = GetSessionStart(localTime);
+        if (sessionStart is null)
+        {
+            return null;
+        }
+
+        var tradingDate = DateOnly.FromDateTime(sessionStart.Value);
+        var sessionEnd = tradingDate.AddDays(1).ToDateTime(NightClose);
         return new DateTimeOffset(sessionEnd, taipeiTime.Offset);
     }
 

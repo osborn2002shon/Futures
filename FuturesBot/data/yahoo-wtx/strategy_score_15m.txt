@@ -1,3 +1,0 @@
-﻿evaluated_at_taipei,sample_time_taipei,bar_start_taipei,bar_end_taipei,signal_type,side,matched_count,total_count,status,consolidation_state,consolidation_flat_sma76_diff_sum,consolidation_cross_count,matched_conditions,missing_conditions
-2026-07-29 10:00:11 +08:00,2026-07-29 10:00:00 +08:00,2026-07-29 09:45:00 +08:00,2026-07-29 10:00:00 +08:00,entry,long,0,5,insufficient_sma_data,unknown,,,,close_cross_above_sma76|sma76_gt_sma76_5_bars_ago|sma20_gt_sma20_5_bars_ago|sma20_gt_sma76|not_consolidating
-2026-07-29 10:00:11 +08:00,2026-07-29 10:00:00 +08:00,2026-07-29 09:45:00 +08:00,2026-07-29 10:00:00 +08:00,entry,short,0,5,insufficient_sma_data,unknown,,,,close_cross_below_sma76|sma76_lt_sma76_5_bars_ago|sma20_lt_sma20_5_bars_ago|sma20_lt_sma76|not_consolidating

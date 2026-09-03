@@ -3,15 +3,18 @@ using System.Globalization;
 internal sealed record EntryRecommendationSettings(
     int AtrPeriod = 14,
     int WaitingFiveMinuteBars = 12,
+    int EntryPreTriggerFiveMinuteBars = 3,
     int TrackingFiveMinuteBars = 24,
     int MinimumReferenceFiveMinuteBars = 6,
     decimal MinimumAtrRatio = 0.5m,
     decimal MaximumAtrRatio = 2.0m,
     decimal EntryLowPercentile = 0.25m,
     decimal EntryHighPercentile = 0.50m,
-    decimal StopMaePercentile = 0.90m,
-    decimal TakeProfitMfePercentile = 0.60m,
-    decimal MinimumRewardRiskRatio = 1.5m)
+    decimal TakeProfitMfePercentile = 0.70m,
+    int StructureStopLookbackFiveMinuteBars = 12,
+    int MinimumStructureStopFiveMinuteBars = 3,
+    decimal StructureStopAtrBuffer = 0.5m,
+    decimal MinimumRewardRiskRatio = 2.0m)
 {
     public static EntryRecommendationSettings Default { get; } = new();
 }
@@ -207,17 +210,21 @@ internal sealed record EntryRecommendationEvent(
     bool IsActive,
     DateTimeOffset? EnteredAt,
     decimal? EntryPrice,
+    decimal? ExitPrice,
+    decimal? ProfitPoints,
     DateTimeOffset? CompletedAt,
     string? Outcome,
     string ConfidenceStatus,
     decimal? ConfidenceScore,
     int ConfidenceSampleCount,
     decimal? EntryHitRate,
+    decimal? RecommendationPrice,
     string SourceMode)
 {
     public static EntryRecommendationEvent FromDraft(
         Sma76Trigger trigger,
-        EntryRecommendationDraft draft) =>
+        EntryRecommendationDraft draft,
+        decimal recommendationPrice) =>
         new(
             0,
             trigger.Symbol,
@@ -250,22 +257,60 @@ internal sealed record EntryRecommendationEvent(
             null,
             null,
             null,
+            null,
+            null,
             draft.Confidence.Status,
             draft.Confidence.Score,
             draft.Confidence.SampleCount,
             draft.Confidence.EntryHitRate,
+            recommendationPrice,
             "live");
 
     public EntryRecommendationEvent Apply(RecommendationTransition transition) =>
         this with
         {
+            StopLoss = transition.StopLoss ?? StopLoss,
+            TakeProfit = transition.TakeProfit ?? TakeProfit,
             Status = transition.NewStatus,
             IsActive = EntryRecommendationStatuses.IsActive(transition.NewStatus),
             EnteredAt = transition.EnteredAt ?? EnteredAt,
-            EntryPrice = transition.EntryPrice ?? EntryPrice,
+            EntryPrice = transition.EntryPrice ?? EntryPrice ?? GetResultEntryPrice(transition),
+            ExitPrice = GetExitPrice(transition) ?? ExitPrice,
+            ProfitPoints = GetProfitPoints(transition) ?? ProfitPoints,
             CompletedAt = transition.CompletedAt ?? CompletedAt,
             Outcome = transition.Outcome ?? Outcome
         };
+
+    private decimal? GetResultEntryPrice(RecommendationTransition transition) =>
+        IsResultStatus(transition.NewStatus)
+            ? EntryPrice ?? transition.EntryPrice ?? RecommendationPrice ?? GetEntryMidpoint() ?? TriggerClose
+            : null;
+
+    private decimal? GetExitPrice(RecommendationTransition transition) =>
+        IsResultStatus(transition.NewStatus) ? transition.ObservedPrice : null;
+
+    private decimal? GetProfitPoints(RecommendationTransition transition)
+    {
+        var entryPrice = GetResultEntryPrice(transition);
+        var exitPrice = GetExitPrice(transition);
+        if (entryPrice is null || exitPrice is null)
+        {
+            return null;
+        }
+
+        var points = Side == StrategySide.Long
+            ? exitPrice.Value - entryPrice.Value
+            : entryPrice.Value - exitPrice.Value;
+        return decimal.Round(points, 4, MidpointRounding.AwayFromZero);
+    }
+
+    private decimal? GetEntryMidpoint() =>
+        EntryLow is { } entryLow && EntryHigh is { } entryHigh
+            ? (entryLow + entryHigh) / 2m
+            : null;
+
+    private static bool IsResultStatus(string status) =>
+        status is EntryRecommendationStatuses.TakeProfit or EntryRecommendationStatuses.StopLoss;
 }
 
 internal sealed record EntryRecommendationDraft(
@@ -294,8 +339,7 @@ internal sealed record RecommendationConfidence(
 internal sealed record ReferenceEventPattern(
     decimal EntryZ25,
     decimal EntryZ50,
-    decimal StopMae90,
-    decimal TakeProfitMfe60);
+    decimal TakeProfitMfe);
 
 internal static class EntryRecommendationPriceCalculator
 {
@@ -346,9 +390,25 @@ internal static class EntryRecommendationPriceCalculator
             var entryLow = Math.Min(entryA, entryB);
             var entryHigh = Math.Max(entryA, entryB);
             var entryMid = (entryLow + entryHigh) / 2m;
-            var stopLoss = RoundPoint(entryMid - side * pattern.StopMae90 * currentAtr);
-            var takeProfit = RoundPoint(entryMid + side * pattern.TakeProfitMfe60 * currentAtr);
+
+            if (!TryCalculateStructureStopLoss(
+                    trigger,
+                    fiveMinuteBars,
+                    currentAtr,
+                    settings,
+                    out var stopLoss))
+            {
+                continue;
+            }
+
             var riskPoints = Math.Abs(entryMid - stopLoss);
+            var historicalTakeProfit = RoundPoint(entryMid + side * pattern.TakeProfitMfe * currentAtr);
+            var minimumRewardTakeProfit = RoundMinimumRewardTakeProfit(
+                trigger.Side,
+                entryMid + side * riskPoints * settings.MinimumRewardRiskRatio);
+            var takeProfit = trigger.Side == StrategySide.Long
+                ? Math.Max(historicalTakeProfit, minimumRewardTakeProfit)
+                : Math.Min(historicalTakeProfit, minimumRewardTakeProfit);
             var rewardPoints = Math.Abs(takeProfit - entryMid);
             var rewardRiskRatio = riskPoints > 0 ? rewardPoints / riskPoints : 0m;
 
@@ -410,8 +470,113 @@ internal static class EntryRecommendationPriceCalculator
             : takeProfit < entryLow && entryHigh < stopLoss;
     }
 
+    private static bool TryCalculateStructureStopLoss(
+        Sma76Trigger trigger,
+        IReadOnlyCollection<KBar> fiveMinuteBars,
+        decimal currentAtr,
+        EntryRecommendationSettings settings,
+        out decimal stopLoss)
+    {
+        stopLoss = default;
+        var sessionEnd = TaiwanFuturesMarketHours.GetSessionEnd(trigger.TriggerBarEnd);
+        if (sessionEnd is null)
+        {
+            return false;
+        }
+
+        var completedBars = fiveMinuteBars
+            .Where(bar =>
+                bar.IntervalMinutes == 5
+                && bar.BarEnd <= trigger.TriggerBarEnd
+                && TaiwanFuturesMarketHours.GetSessionEnd(bar.BarStart) == sessionEnd)
+            .OrderBy(bar => bar.BarStart)
+            .ToArray();
+        var preTriggerBars = completedBars
+            .Where(bar => bar.BarEnd <= trigger.TriggerBarStart)
+            .OrderByDescending(bar => bar.BarStart)
+            .Take(settings.StructureStopLookbackFiveMinuteBars)
+            .ToArray();
+        var triggerBars = completedBars
+            .Where(bar =>
+                bar.BarStart >= trigger.TriggerBarStart
+                && bar.BarEnd <= trigger.TriggerBarEnd)
+            .ToArray();
+        var structureBars = preTriggerBars
+            .Concat(triggerBars)
+            .OrderBy(bar => bar.BarStart)
+            .ToArray();
+        if (structureBars.Length < settings.MinimumStructureStopFiveMinuteBars)
+        {
+            return false;
+        }
+
+        var buffer = settings.StructureStopAtrBuffer * currentAtr;
+        if (!TryFindRecentSwingStopAnchor(trigger.Side, structureBars, out var stopAnchor))
+        {
+            var fallbackBars = triggerBars.Length > 0 ? triggerBars : structureBars;
+            stopAnchor = trigger.Side == StrategySide.Long
+                ? fallbackBars.Min(bar => bar.Low)
+                : fallbackBars.Max(bar => bar.High);
+        }
+
+        if (trigger.Side == StrategySide.Long)
+        {
+            var structureLow = Math.Min(stopAnchor, trigger.TriggerSma76);
+            stopLoss = RoundPoint(structureLow - buffer);
+        }
+        else
+        {
+            var structureHigh = Math.Max(stopAnchor, trigger.TriggerSma76);
+            stopLoss = RoundPoint(structureHigh + buffer);
+        }
+
+        return true;
+    }
+
+    private static bool TryFindRecentSwingStopAnchor(
+        StrategySide side,
+        IReadOnlyList<KBar> structureBars,
+        out decimal stopAnchor)
+    {
+        stopAnchor = default;
+        if (structureBars.Count < 3)
+        {
+            return false;
+        }
+
+        for (var i = structureBars.Count - 2; i > 0; i--)
+        {
+            var previous = structureBars[i - 1];
+            var current = structureBars[i];
+            var next = structureBars[i + 1];
+
+            if (side == StrategySide.Long
+                && current.Low <= previous.Low
+                && current.Low <= next.Low)
+            {
+                stopAnchor = current.Low;
+                return true;
+            }
+
+            if (side == StrategySide.Short
+                && current.High >= previous.High
+                && current.High >= next.High)
+            {
+                stopAnchor = current.High;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static decimal RoundPoint(decimal value) =>
         decimal.Round(value, 0, MidpointRounding.AwayFromZero);
+
+    private static decimal RoundMinimumRewardTakeProfit(StrategySide side, decimal value) =>
+        side == StrategySide.Long
+            ? decimal.Ceiling(value)
+            : decimal.Floor(value);
 }
 
 internal static class ReferenceEventPatternBuilder
@@ -431,7 +596,8 @@ internal static class ReferenceEventPatternBuilder
         }
 
         var sessionEnd = TaiwanFuturesMarketHours.GetSessionEnd(reference.TriggerBarEnd);
-        if (sessionEnd is null)
+        var nightSessionEnd = TaiwanFuturesMarketHours.GetTradingDayNightSessionEnd(reference.TriggerBarEnd);
+        if (sessionEnd is null || nightSessionEnd is null)
         {
             return false;
         }
@@ -441,7 +607,7 @@ internal static class ReferenceEventPatternBuilder
             .OrderBy(item => item.TriggerAt)
             .Select(item => (DateTimeOffset?)item.TriggerAt)
             .FirstOrDefault();
-        var eventEnd = Min(sessionEnd.Value, currentTriggerAt);
+        var eventEnd = Min(nightSessionEnd.Value, currentTriggerAt);
         if (nextOppositeTrigger is { } oppositeAt)
         {
             eventEnd = Min(eventEnd, oppositeAt);
@@ -454,17 +620,29 @@ internal static class ReferenceEventPatternBuilder
                 && bar.BarEnd <= eventEnd)
             .OrderBy(bar => bar.BarStart)
             .ToArray();
-        var waitingBars = eventBars
-            .Take(settings.WaitingFiveMinuteBars)
-            .ToArray();
+        var waitingBars = eventBars.ToArray();
         if (waitingBars.Length < settings.MinimumReferenceFiveMinuteBars)
         {
             return false;
         }
 
+        var preTriggerEntryBars = fiveMinuteBars
+            .Where(bar =>
+                bar.IntervalMinutes == 5
+                && bar.BarStart >= reference.TriggerBarStart
+                && bar.BarEnd <= reference.TriggerBarEnd
+                && TaiwanFuturesMarketHours.GetSessionEnd(bar.BarStart) == sessionEnd)
+            .OrderByDescending(bar => bar.BarStart)
+            .Take(settings.EntryPreTriggerFiveMinuteBars)
+            .ToArray();
+        var entrySampleBars = preTriggerEntryBars
+            .Concat(waitingBars)
+            .OrderBy(bar => bar.BarStart)
+            .ToArray();
+
         // 多空都轉換成「數值越小，回檔越有利」的標準化距離，才能共用百分位規則。
         var side = reference.Side == StrategySide.Long ? 1m : -1m;
-        var entryDistances = waitingBars
+        var entryDistances = entrySampleBars
             .Select(bar =>
             {
                 var favorablePrice = reference.Side == StrategySide.Long ? bar.Low : bar.High;
@@ -487,31 +665,24 @@ internal static class ReferenceEventPatternBuilder
 
         var trackingBars = eventBars
             .Where(bar => bar.BarStart >= entryBar.BarStart)
-            .Take(settings.TrackingFiveMinuteBars)
             .ToArray();
         if (trackingBars.Length == 0)
         {
             return false;
         }
 
-        var adverse = trackingBars
-            .Select(bar => reference.Side == StrategySide.Long
-                ? Math.Max(0m, referenceEntryMid - bar.Low) / atr
-                : Math.Max(0m, bar.High - referenceEntryMid) / atr)
-            .ToArray();
         var favorable = trackingBars
             .Select(bar => reference.Side == StrategySide.Long
                 ? Math.Max(0m, bar.High - referenceEntryMid) / atr
                 : Math.Max(0m, referenceEntryMid - bar.Low) / atr)
             .ToArray();
-        var stopMae90 = Percentile(adverse, settings.StopMaePercentile);
-        var takeProfitMfe60 = Percentile(favorable, settings.TakeProfitMfePercentile);
-        if (stopMae90 <= 0 || takeProfitMfe60 <= 0)
+        var takeProfitMfe = Percentile(favorable, settings.TakeProfitMfePercentile);
+        if (takeProfitMfe <= 0)
         {
             return false;
         }
 
-        pattern = new ReferenceEventPattern(entryZ25, entryZ50, stopMae90, takeProfitMfe60);
+        pattern = new ReferenceEventPattern(entryZ25, entryZ50, takeProfitMfe);
         return true;
     }
 
@@ -547,7 +718,33 @@ internal sealed record RecommendationTransition(
     decimal? EntryPrice,
     DateTimeOffset? CompletedAt,
     string? Outcome,
-    string Note);
+    decimal? StopLoss,
+    decimal? TakeProfit,
+    string Note)
+{
+    public RecommendationTransition(
+        string newStatus,
+        DateTimeOffset changedAt,
+        decimal? observedPrice,
+        DateTimeOffset? enteredAt,
+        decimal? entryPrice,
+        DateTimeOffset? completedAt,
+        string? outcome,
+        string note)
+        : this(
+            newStatus,
+            changedAt,
+            observedPrice,
+            enteredAt,
+            entryPrice,
+            completedAt,
+            outcome,
+            null,
+            null,
+            note)
+    {
+    }
+}
 
 internal static class RecommendationLifecycleEvaluator
 {
@@ -582,6 +779,24 @@ internal static class RecommendationLifecycleEvaluator
             EntryRecommendationStatuses.Cancelled,
             "入場前出現反方向 SMA76 突破／跌破事件");
 
+    public static RecommendationTransition CloseAtPrice(
+        EntryRecommendationEvent active,
+        DateTimeOffset changedAt,
+        decimal observedPrice,
+        string note)
+    {
+        var status = GetExitStatus(active, observedPrice);
+        return new RecommendationTransition(
+            status,
+            changedAt,
+            observedPrice,
+            null,
+            null,
+            changedAt,
+            status,
+            note);
+    }
+
     private static RecommendationTransition? EvaluateWaiting(
         EntryRecommendationEvent active,
         IReadOnlyCollection<FuturesTick> ticks,
@@ -594,15 +809,16 @@ internal static class RecommendationLifecycleEvaluator
             return null;
         }
 
-        var entryTick = ticks
+        var nightSessionEnd = TaiwanFuturesMarketHours.GetTradingDayNightSessionEnd(active.TriggerAt);
+        var evaluationEnd = nightSessionEnd is { } nightClose && sampleTime >= nightClose ? nightClose : sampleTime;
+        var observedTicks = ticks
             .Where(tick =>
                 tick.Symbol == active.Symbol
                 && tick.CapturedAt >= active.TriggerAt
-                && tick.CapturedAt <= sampleTime
-                && tick.Price >= entryLow
-                && tick.Price <= entryHigh)
+                && MarketDataClock.GetSampleMinute(tick) <= evaluationEnd)
             .OrderBy(tick => tick.CapturedAt)
-            .FirstOrDefault();
+            .ToArray();
+        var entryTick = observedTicks.FirstOrDefault(tick => IsInEntryRange(tick.Price, entryLow, entryHigh));
         if (entryTick != default)
         {
             return new RecommendationTransition(
@@ -616,12 +832,37 @@ internal static class RecommendationLifecycleEvaluator
                 "即時報價首次進入建議區間");
         }
 
+        var crossedEntry = FindCrossedEntry(observedTicks, entryLow, entryHigh);
+        if (crossedEntry is not null)
+        {
+            return new RecommendationTransition(
+                EntryRecommendationStatuses.Entered,
+                crossedEntry.Value.Tick.CapturedAt,
+                crossedEntry.Value.Tick.Price,
+                crossedEntry.Value.Tick.CapturedAt,
+                crossedEntry.Value.EntryPrice,
+                null,
+                null,
+                "Entry range crossed between sampled quotes.");
+        }
+
+        if (TryCloseAtTradingDayNightClose(
+                active,
+                ticks,
+                fiveMinuteBars,
+                sampleTime,
+                "Closed at trading-day night-session close while still waiting for entry.",
+                out var closeTransition))
+        {
+            return closeTransition;
+        }
+
         var completedWaitingBars = CountCompletedBars(
             fiveMinuteBars,
             active.TriggerBarEnd,
             sampleTime);
-        var sessionEnd = TaiwanFuturesMarketHours.GetSessionEnd(active.TriggerAt);
-        if (completedWaitingBars >= settings.WaitingFiveMinuteBars
+        DateTimeOffset? sessionEnd = null;
+        if (completedWaitingBars >= int.MaxValue
             || sessionEnd is { } end && sampleTime >= end)
         {
             var completedAt = sessionEnd is { } close && close < sampleTime ? close : sampleTime;
@@ -653,12 +894,15 @@ internal static class RecommendationLifecycleEvaluator
             return null;
         }
 
+        var nightSessionEnd = TaiwanFuturesMarketHours.GetTradingDayNightSessionEnd(active.TriggerAt);
+        var evaluationEnd = nightSessionEnd is { } nightClose && sampleTime >= nightClose ? nightClose : sampleTime;
+
         // 逐分鐘報價依時間排序，確保停損與停利只採用第一個真正碰到的結果。
         foreach (var tick in ticks
                      .Where(tick =>
                          tick.Symbol == active.Symbol
                          && tick.CapturedAt >= enteredAt
-                         && tick.CapturedAt <= sampleTime)
+                         && MarketDataClock.GetSampleMinute(tick) <= evaluationEnd)
                      .OrderBy(tick => tick.CapturedAt))
         {
             var stopHit = active.Side == StrategySide.Long
@@ -687,9 +931,20 @@ internal static class RecommendationLifecycleEvaluator
             }
         }
 
+        if (TryCloseAtTradingDayNightClose(
+                active,
+                ticks,
+                fiveMinuteBars,
+                sampleTime,
+                "Closed at trading-day night-session close after entry.",
+                out var closeTransition))
+        {
+            return closeTransition;
+        }
+
         var completedTrackingBars = CountCompletedBars(fiveMinuteBars, enteredAt, sampleTime);
-        var sessionEnd = TaiwanFuturesMarketHours.GetSessionEnd(active.TriggerAt);
-        if (completedTrackingBars >= settings.TrackingFiveMinuteBars
+        DateTimeOffset? sessionEnd = null;
+        if (completedTrackingBars >= int.MaxValue
             || sessionEnd is { } end && sampleTime >= end)
         {
             var completedAt = sessionEnd is { } close && close < sampleTime ? close : sampleTime;
@@ -710,6 +965,146 @@ internal static class RecommendationLifecycleEvaluator
         string note) =>
         new(status, changedAt, observedPrice, null, null, changedAt, status, note);
 
+    private static bool TryCloseAtTradingDayNightClose(
+        EntryRecommendationEvent active,
+        IReadOnlyCollection<FuturesTick> ticks,
+        IReadOnlyCollection<KBar> fiveMinuteBars,
+        DateTimeOffset sampleTime,
+        string note,
+        out RecommendationTransition transition)
+    {
+        transition = default!;
+        var closeAt = TaiwanFuturesMarketHours.GetTradingDayNightSessionEnd(active.TriggerAt);
+        if (closeAt is null || sampleTime < closeAt.Value)
+        {
+            return false;
+        }
+
+        if (!TryGetClosePrice(active, ticks, fiveMinuteBars, closeAt.Value, out var closePrice))
+        {
+            return false;
+        }
+
+        transition = CloseAtPrice(active, closeAt.Value, closePrice, note);
+        return true;
+    }
+
+    private static bool TryGetClosePrice(
+        EntryRecommendationEvent active,
+        IReadOnlyCollection<FuturesTick> ticks,
+        IReadOnlyCollection<KBar> fiveMinuteBars,
+        DateTimeOffset closeAt,
+        out decimal closePrice)
+    {
+        var closeTickPrice = ticks
+            .Where(tick =>
+                tick.Symbol == active.Symbol
+                && MarketDataClock.GetSampleMinute(tick) >= active.TriggerAt
+                && MarketDataClock.GetSampleMinute(tick) <= closeAt)
+            .OrderBy(MarketDataClock.GetSampleMinute)
+            .ThenBy(tick => tick.CapturedAt)
+            .Select(tick => (decimal?)tick.Price)
+            .LastOrDefault();
+        if (closeTickPrice is { } tickPrice)
+        {
+            closePrice = tickPrice;
+            return true;
+        }
+
+        var closeBarPrice = fiveMinuteBars
+            .Where(bar =>
+                bar.Symbol == active.Symbol
+                && bar.IntervalMinutes == 5
+                && bar.BarEnd >= active.TriggerAt
+                && bar.BarEnd <= closeAt)
+            .OrderBy(bar => bar.BarEnd)
+            .Select(bar => (decimal?)bar.Close)
+            .LastOrDefault();
+        if (closeBarPrice is { } barPrice)
+        {
+            closePrice = barPrice;
+            return true;
+        }
+
+        closePrice = default;
+        return false;
+    }
+
+    private static string GetExitStatus(EntryRecommendationEvent active, decimal observedPrice)
+    {
+        var takeProfitHit = active.TakeProfit is { } takeProfit
+            && (active.Side == StrategySide.Long
+                ? observedPrice >= takeProfit
+                : observedPrice <= takeProfit);
+        if (takeProfitHit)
+        {
+            return EntryRecommendationStatuses.TakeProfit;
+        }
+
+        var stopLossHit = active.StopLoss is { } stopLoss
+            && (active.Side == StrategySide.Long
+                ? observedPrice <= stopLoss
+                : observedPrice >= stopLoss);
+        if (stopLossHit)
+        {
+            return EntryRecommendationStatuses.StopLoss;
+        }
+
+        var referencePrice =
+            active.EntryPrice
+            ?? active.RecommendationPrice
+            ?? GetEntryMidpoint(active)
+            ?? active.TriggerClose;
+        var favorable = active.Side == StrategySide.Long
+            ? observedPrice >= referencePrice
+            : observedPrice <= referencePrice;
+        return favorable
+            ? EntryRecommendationStatuses.TakeProfit
+            : EntryRecommendationStatuses.StopLoss;
+    }
+
+    private static decimal? GetEntryMidpoint(EntryRecommendationEvent active) =>
+        active.EntryLow is { } entryLow && active.EntryHigh is { } entryHigh
+            ? (entryLow + entryHigh) / 2m
+            : null;
+
+    private static (FuturesTick Tick, decimal EntryPrice)? FindCrossedEntry(
+        IReadOnlyList<FuturesTick> observedTicks,
+        decimal entryLow,
+        decimal entryHigh)
+    {
+        FuturesTick? previousTick = null;
+        foreach (var tick in observedTicks)
+        {
+            if (previousTick is { } previous
+                && CrossedEntryRange(previous.Price, tick.Price, entryLow, entryHigh))
+            {
+                return (tick, EstimateCrossedEntryPrice(previous.Price, entryLow, entryHigh));
+            }
+
+            previousTick = tick;
+        }
+
+        return null;
+    }
+
+    private static bool IsInEntryRange(decimal price, decimal entryLow, decimal entryHigh) =>
+        price >= entryLow && price <= entryHigh;
+
+    private static bool CrossedEntryRange(
+        decimal previousPrice,
+        decimal currentPrice,
+        decimal entryLow,
+        decimal entryHigh) =>
+        previousPrice < entryLow && currentPrice > entryHigh
+        || previousPrice > entryHigh && currentPrice < entryLow;
+
+    private static decimal EstimateCrossedEntryPrice(
+        decimal previousPrice,
+        decimal entryLow,
+        decimal entryHigh) =>
+        previousPrice < entryLow ? entryLow : entryHigh;
+
     private static int CountCompletedBars(
         IReadOnlyCollection<KBar> fiveMinuteBars,
         DateTimeOffset start,
@@ -726,4 +1121,3 @@ internal sealed record RecommendationChange(
     DateTimeOffset ChangedAt,
     decimal? ObservedPrice,
     string Note);
-

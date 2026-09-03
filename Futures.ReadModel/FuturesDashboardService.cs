@@ -1,14 +1,21 @@
 using System.Data;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
-namespace FuturesMonitor.Services;
+namespace Futures.ReadModel;
 
 public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options, ILogger<FuturesDashboardService> logger)
 {
     private const int QuoteHistoryPointCount = 180;
     private const int MarketContextHistoryRowsPerSide = 500;
     private const int RecommendationHistoryRows = 24;
+    private const int MinuteKBarsWindowHours = 24;
+    private const int CurrentSmaIntervalMinutes = 15;
+    private const int FastSmaPeriod = 20;
+    private const int SlowSmaPeriod = 76;
+
+    public static readonly IReadOnlySet<int> SupportedMinuteKIntervals = new HashSet<int> { 1, 5, 15, 30, 60 };
 
     private static readonly TimeZoneInfo TaipeiTimeZone = GetTaipeiTimeZone();
 
@@ -20,6 +27,7 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
                 "close_cross_above_sma76",
                 "sma76_gt_sma76_5_bars_ago",
                 "sma20_gt_sma20_5_bars_ago",
+                "fifteen_min_close_gt_sma20",
                 "sma20_gt_sma76",
                 "not_consolidating",
                 "one_min_close_gt_sma60"
@@ -29,6 +37,7 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
                 "close_cross_below_sma76",
                 "sma76_lt_sma76_5_bars_ago",
                 "sma20_lt_sma20_5_bars_ago",
+                "fifteen_min_close_lt_sma20",
                 "sma20_lt_sma76",
                 "not_consolidating",
                 "one_min_close_lt_sma60"
@@ -44,6 +53,8 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
             ["sma76_lt_sma76_5_bars_ago"] = "SMA76 低於 5 根前",
             ["sma20_gt_sma20_5_bars_ago"] = "SMA20 高於 5 根前",
             ["sma20_lt_sma20_5_bars_ago"] = "SMA20 低於 5 根前",
+            ["fifteen_min_close_gt_sma20"] = "15分K收盤位於 SMA20 上方",
+            ["fifteen_min_close_lt_sma20"] = "15分K收盤位於 SMA20 下方",
             ["sma20_gt_sma76"] = "SMA20 位於 SMA76 上方",
             ["sma20_lt_sma76"] = "SMA20 位於 SMA76 下方",
             ["not_consolidating"] = "目前非盤整",
@@ -89,6 +100,10 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
             await connection.OpenAsync(cancellationToken);
 
             var quote = await ReadLatestQuoteAsync(connection, serverTime, cancellationToken);
+            var currentSma = await ReadCurrentSmaAsync(
+                connection,
+                quote?.SampleMinuteTaipei ?? serverTime,
+                cancellationToken);
             var quoteHistory = await ReadQuoteHistoryAsync(connection, cancellationToken);
             var marketContexts = await ReadLatestMarketContextsAsync(
                 connection,
@@ -102,6 +117,7 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
                 null,
                 serverTime,
                 quote,
+                currentSma,
                 quoteHistory,
                 marketContexts,
                 latestRecommendation,
@@ -116,11 +132,254 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
                 $"無法讀取 SQL 資料：{ex.Message}",
                 serverTime,
                 null,
+                null,
                 [],
                 [],
                 null,
                 []);
         }
+    }
+
+    public async Task<MinuteKBarsSnapshot> GetMinuteKBarsAsync(int intervalMinutes, CancellationToken cancellationToken)
+    {
+        var generatedAtTaipei = GetTaipeiNow();
+        var toTaipei = generatedAtTaipei;
+        var fromTaipei = generatedAtTaipei.AddHours(-MinuteKBarsWindowHours);
+
+        try
+        {
+            await using var connection = new SqlConnection(_options.BuildConnectionString());
+            await connection.OpenAsync(cancellationToken);
+
+            var latestDataTime = await ReadLatestMinuteKBarDataTimeAsync(connection, intervalMinutes, cancellationToken);
+            if (latestDataTime is null)
+            {
+                return new MinuteKBarsSnapshot(
+                    true,
+                    null,
+                    _options.Symbol,
+                    intervalMinutes,
+                    generatedAtTaipei,
+                    fromTaipei,
+                    toTaipei,
+                    []);
+            }
+
+            toTaipei = latestDataTime.Value;
+            fromTaipei = toTaipei.AddHours(-MinuteKBarsWindowHours);
+
+            var bars = intervalMinutes == 1
+                ? await ReadOneMinuteKBarsAsync(connection, fromTaipei, toTaipei, cancellationToken)
+                : await ReadPersistedMinuteKBarsAsync(connection, intervalMinutes, fromTaipei, toTaipei, cancellationToken);
+
+            return new MinuteKBarsSnapshot(
+                true,
+                null,
+                _options.Symbol,
+                intervalMinutes,
+                generatedAtTaipei,
+                fromTaipei,
+                toTaipei,
+                bars);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogWarning(ex, "Unable to read futures minute K bars.");
+
+            return new MinuteKBarsSnapshot(
+                false,
+                $"Unable to read SQL data: {ex.Message}",
+                _options.Symbol,
+                intervalMinutes,
+                generatedAtTaipei,
+                fromTaipei,
+                toTaipei,
+                []);
+        }
+    }
+
+    private async Task<DateTimeOffset?> ReadLatestMinuteKBarDataTimeAsync(
+        SqlConnection connection,
+        int intervalMinutes,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        if (intervalMinutes == 1)
+        {
+            command.CommandText = """
+                SELECT TOP (1) SampleMinuteTaipei
+                FROM dbo.FuturesTicks
+                WHERE Symbol = @symbol
+                ORDER BY SampleMinuteTaipei DESC, CapturedAtTaipei DESC, Id DESC;
+                """;
+        }
+        else
+        {
+            command.CommandText = """
+                SELECT TOP (1) BarEndTaipei
+                FROM dbo.FuturesKBars
+                WHERE Symbol = @symbol
+                  AND IntervalMinutes = @intervalMinutes
+                ORDER BY BarEndTaipei DESC, UpdatedAtTaipei DESC, BarStartTaipei DESC;
+                """;
+            command.Parameters.Add("@intervalMinutes", SqlDbType.Int).Value = intervalMinutes;
+        }
+
+        AddStringParameter(command, "@symbol", _options.Symbol, 32);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken)
+            ? reader.GetDateTimeOffset(0)
+            : null;
+    }
+
+    private async Task<IReadOnlyList<MinuteKBarSnapshot>> ReadOneMinuteKBarsAsync(
+        SqlConnection connection,
+        DateTimeOffset fromTaipei,
+        DateTimeOffset toTaipei,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT
+                SampleMinuteTaipei,
+                Price,
+                CapturedAtTaipei
+            FROM dbo.FuturesTicks
+            WHERE Symbol = @symbol
+              AND SampleMinuteTaipei >= @fromTaipei
+              AND SampleMinuteTaipei <= @toTaipei
+            ORDER BY SampleMinuteTaipei, CapturedAtTaipei, Id;
+            """;
+        AddStringParameter(command, "@symbol", _options.Symbol, 32);
+        AddDateTimeOffsetParameter(command, "@fromTaipei", fromTaipei);
+        AddDateTimeOffsetParameter(command, "@toTaipei", toTaipei);
+
+        var bars = new List<MinuteKBarSnapshot>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var sampleMinute = reader.GetDateTimeOffset(0);
+            var price = reader.GetDecimal(1);
+            var capturedAt = reader.GetDateTimeOffset(2);
+            var barStart = GetMinuteCloseBarStart(sampleMinute.DateTime, 1)
+                ?? sampleMinute.DateTime.AddMinutes(-1);
+            var barEnd = barStart.AddMinutes(1);
+
+            bars.Add(new MinuteKBarSnapshot(
+                new DateTimeOffset(barStart, TaipeiTimeZone.GetUtcOffset(barStart)),
+                new DateTimeOffset(barEnd, TaipeiTimeZone.GetUtcOffset(barEnd)),
+                price,
+                price,
+                price,
+                price,
+                1,
+                capturedAt));
+        }
+
+        return bars;
+    }
+
+    private async Task<IReadOnlyList<MinuteKBarSnapshot>> ReadPersistedMinuteKBarsAsync(
+        SqlConnection connection,
+        int intervalMinutes,
+        DateTimeOffset fromTaipei,
+        DateTimeOffset toTaipei,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT
+                BarStartTaipei,
+                BarEndTaipei,
+                OpenPrice,
+                HighPrice,
+                LowPrice,
+                ClosePrice,
+                SourceCount,
+                UpdatedAtTaipei
+            FROM dbo.FuturesKBars
+            WHERE Symbol = @symbol
+              AND IntervalMinutes = @intervalMinutes
+              AND BarEndTaipei >= @fromTaipei
+              AND BarStartTaipei <= @toTaipei
+            ORDER BY BarStartTaipei;
+            """;
+        AddStringParameter(command, "@symbol", _options.Symbol, 32);
+        command.Parameters.Add("@intervalMinutes", SqlDbType.Int).Value = intervalMinutes;
+        AddDateTimeOffsetParameter(command, "@fromTaipei", fromTaipei);
+        AddDateTimeOffsetParameter(command, "@toTaipei", toTaipei);
+
+        var bars = new List<MinuteKBarSnapshot>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            bars.Add(new MinuteKBarSnapshot(
+                reader.GetDateTimeOffset(0),
+                reader.GetDateTimeOffset(1),
+                reader.GetDecimal(2),
+                reader.GetDecimal(3),
+                reader.GetDecimal(4),
+                reader.GetDecimal(5),
+                reader.GetInt32(6),
+                reader.GetDateTimeOffset(7)));
+        }
+
+        return bars;
+    }
+
+    private async Task<CurrentSmaSnapshot?> ReadCurrentSmaAsync(
+        SqlConnection connection,
+        DateTimeOffset sampleMinuteTaipei,
+        CancellationToken cancellationToken)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT TOP (@barCount)
+                Symbol,
+                BarStartTaipei,
+                BarEndTaipei,
+                ClosePrice,
+                UpdatedAtTaipei
+            FROM dbo.FuturesKBars
+            WHERE Symbol = @symbol
+              AND IntervalMinutes = @intervalMinutes
+              AND BarEndTaipei <= @sampleMinuteTaipei
+            ORDER BY BarEndTaipei DESC, UpdatedAtTaipei DESC, BarStartTaipei DESC;
+            """;
+        command.Parameters.Add("@barCount", SqlDbType.Int).Value = SlowSmaPeriod;
+        AddStringParameter(command, "@symbol", _options.Symbol, 32);
+        command.Parameters.Add("@intervalMinutes", SqlDbType.Int).Value = CurrentSmaIntervalMinutes;
+        AddDateTimeOffsetParameter(command, "@sampleMinuteTaipei", sampleMinuteTaipei);
+
+        var rows = new List<SmaBarRow>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            rows.Add(new SmaBarRow(
+                reader.GetString(0),
+                reader.GetDateTimeOffset(1),
+                reader.GetDateTimeOffset(2),
+                reader.GetDecimal(3),
+                reader.GetDateTimeOffset(4)));
+        }
+
+        if (rows.Count == 0)
+        {
+            return null;
+        }
+
+        var latest = rows[0];
+        return new CurrentSmaSnapshot(
+            latest.Symbol,
+            CurrentSmaIntervalMinutes,
+            latest.BarStartTaipei,
+            latest.BarEndTaipei,
+            latest.ClosePrice,
+            CalculateSma(rows, FastSmaPeriod),
+            CalculateSma(rows, SlowSmaPeriod),
+            rows.Count,
+            latest.UpdatedAtTaipei);
     }
 
     private async Task<FuturesQuoteSnapshot?> ReadLatestQuoteAsync(
@@ -407,9 +666,11 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
         command.CommandText = $"""
             SELECT TOP (1)
                 {RecommendationSelectColumns}
-            FROM dbo.EntryRecommendationEvents
-            WHERE Symbol = @symbol
-            ORDER BY IsActive DESC, TriggerAtTaipei DESC, Id DESC;
+            FROM dbo.EntryRecommendationEvents AS events
+            LEFT JOIN dbo.EntryRecommendationEvents AS reference
+                ON reference.Id = events.ReferenceEventId
+            WHERE events.Symbol = @symbol
+            ORDER BY events.IsActive DESC, events.TriggerAtTaipei DESC, events.Id DESC;
             """;
         AddStringParameter(command, "@symbol", _options.Symbol, 32);
 
@@ -432,9 +693,11 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
         command.CommandText = $"""
             SELECT TOP (@rowCount)
                 {RecommendationSelectColumns}
-            FROM dbo.EntryRecommendationEvents
-            WHERE Symbol = @symbol
-            ORDER BY TriggerAtTaipei DESC, Id DESC;
+            FROM dbo.EntryRecommendationEvents AS events
+            LEFT JOIN dbo.EntryRecommendationEvents AS reference
+                ON reference.Id = events.ReferenceEventId
+            WHERE events.Symbol = @symbol
+            ORDER BY events.TriggerAtTaipei DESC, events.Id DESC;
             """;
         AddStringParameter(command, "@symbol", _options.Symbol, 32);
         command.Parameters.Add("@rowCount", SqlDbType.Int).Value = RecommendationHistoryRows;
@@ -457,6 +720,12 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
         var status = reader.GetString(25);
         var outcome = await reader.IsDBNullAsync(30, cancellationToken) ? null : reader.GetString(30);
         var confidenceStatus = reader.GetString(31);
+        var referenceSide = await reader.IsDBNullAsync(38, cancellationToken)
+            ? null
+            : reader.GetString(38).ToLowerInvariant();
+        var referenceStatus = await reader.IsDBNullAsync(41, cancellationToken)
+            ? null
+            : reader.GetString(41);
 
         return new EntryRecommendationSnapshot(
             reader.GetInt64(0),
@@ -477,6 +746,13 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
             await reader.IsDBNullAsync(13, cancellationToken) ? null : reader.GetDecimal(13),
             await reader.IsDBNullAsync(14, cancellationToken) ? null : reader.GetDecimal(14),
             await reader.IsDBNullAsync(16, cancellationToken) ? null : reader.GetInt64(16),
+            await reader.IsDBNullAsync(37, cancellationToken) ? null : reader.GetDateTimeOffset(37),
+            referenceSide,
+            referenceSide is null ? null : GetSideLabel(referenceSide),
+            await reader.IsDBNullAsync(39, cancellationToken) ? null : reader.GetDecimal(39),
+            await reader.IsDBNullAsync(40, cancellationToken) ? null : reader.GetDecimal(40),
+            referenceStatus,
+            referenceStatus is null ? null : GetRecommendationStatusLabel(referenceStatus),
             await reader.IsDBNullAsync(17, cancellationToken) ? null : reader.GetDecimal(17),
             await reader.IsDBNullAsync(20, cancellationToken) ? null : reader.GetDecimal(20),
             await reader.IsDBNullAsync(21, cancellationToken) ? null : reader.GetDecimal(21),
@@ -488,6 +764,8 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
             reader.GetBoolean(26),
             await reader.IsDBNullAsync(27, cancellationToken) ? null : reader.GetDateTimeOffset(27),
             await reader.IsDBNullAsync(28, cancellationToken) ? null : reader.GetDecimal(28),
+            await reader.IsDBNullAsync(42, cancellationToken) ? null : reader.GetDecimal(42),
+            await reader.IsDBNullAsync(43, cancellationToken) ? null : reader.GetDecimal(43),
             await reader.IsDBNullAsync(29, cancellationToken) ? null : reader.GetDateTimeOffset(29),
             outcome,
             GetOutcomeLabel(outcome),
@@ -496,7 +774,8 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
             await reader.IsDBNullAsync(32, cancellationToken) ? null : reader.GetDecimal(32),
             reader.GetInt32(33),
             await reader.IsDBNullAsync(34, cancellationToken) ? null : reader.GetDecimal(34),
-            reader.GetString(35));
+            await reader.IsDBNullAsync(35, cancellationToken) ? null : reader.GetDecimal(35),
+            reader.GetString(36));
     }
 
     private static IReadOnlyList<MarketConditionSnapshot> BuildConditionSnapshots(
@@ -608,6 +887,22 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
             .Split('|', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+    private static decimal? CalculateSma(IReadOnlyList<SmaBarRow> rows, int period)
+    {
+        if (rows.Count < period)
+        {
+            return null;
+        }
+
+        var sum = 0m;
+        for (var i = 0; i < period; i++)
+        {
+            sum += rows[i].ClosePrice;
+        }
+
+        return sum / period;
+    }
+
     private static async Task<bool> TableExistsAsync(
         SqlConnection connection,
         string tableName,
@@ -699,6 +994,68 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
     private static DateTimeOffset GetTaipeiNow() =>
         TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, TaipeiTimeZone);
 
+    private static DateTime? GetMinuteCloseBarStart(DateTime taipeiLocalTime, int intervalMinutes)
+    {
+        var sessionStart = GetSessionStart(taipeiLocalTime);
+        if (sessionStart is null)
+        {
+            return null;
+        }
+
+        if (taipeiLocalTime <= sessionStart.Value)
+        {
+            return sessionStart.Value;
+        }
+
+        return GetBarStart(taipeiLocalTime.AddTicks(-1), intervalMinutes);
+    }
+
+    private static DateTime? GetBarStart(DateTime taipeiLocalTime, int intervalMinutes)
+    {
+        var sessionStart = GetSessionStart(taipeiLocalTime);
+        if (sessionStart is null)
+        {
+            return null;
+        }
+
+        var elapsedMinutes = (int)Math.Floor((taipeiLocalTime - sessionStart.Value).TotalMinutes);
+        if (elapsedMinutes < 0)
+        {
+            return null;
+        }
+
+        var bucketOffset = elapsedMinutes / intervalMinutes * intervalMinutes;
+        return sessionStart.Value.AddMinutes(bucketOffset);
+    }
+
+    private static DateTime? GetSessionStart(DateTime taipeiLocalTime)
+    {
+        var time = TimeOnly.FromDateTime(taipeiLocalTime);
+        var date = DateOnly.FromDateTime(taipeiLocalTime);
+        var day = taipeiLocalTime.DayOfWeek;
+
+        if (IsWeekday(day) && time >= new TimeOnly(8, 45) && time <= new TimeOnly(13, 45))
+        {
+            return date.ToDateTime(new TimeOnly(8, 45));
+        }
+
+        if (IsWeekday(day) && time >= new TimeOnly(15, 0))
+        {
+            return date.ToDateTime(new TimeOnly(15, 0));
+        }
+
+        if (IsTuesdayToSaturday(day) && time <= new TimeOnly(5, 0))
+        {
+            return date.AddDays(-1).ToDateTime(new TimeOnly(15, 0));
+        }
+
+        return null;
+    }
+
+    private static bool IsWeekday(DayOfWeek day) => day is >= DayOfWeek.Monday and <= DayOfWeek.Friday;
+
+    private static bool IsTuesdayToSaturday(DayOfWeek day) => day is >= DayOfWeek.Tuesday and <= DayOfWeek.Saturday;
+
     private static TimeZoneInfo GetTaipeiTimeZone()
     {
         foreach (var id in new[] { "Taipei Standard Time", "Asia/Taipei" })
@@ -747,45 +1104,60 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
         decimal Price,
         string SourceUrl);
 
+    private sealed record SmaBarRow(
+        string Symbol,
+        DateTimeOffset BarStartTaipei,
+        DateTimeOffset BarEndTaipei,
+        decimal ClosePrice,
+        DateTimeOffset UpdatedAtTaipei);
+
     private sealed record ReferenceCloseRow(decimal Price, DateTimeOffset SampleMinuteTaipei);
 
     private const string RecommendationSelectColumns = """
-        Id,
-        Symbol,
-        EvaluatedAtTaipei,
-        TriggerAtTaipei,
-        TriggerBarStartTaipei,
-        TriggerBarEndTaipei,
-        Side,
-        EventType,
-        TriggerRule,
-        PreviousClose,
-        PreviousSma76,
-        TriggerClose,
-        TriggerSma76,
-        TriggerSma20,
-        TriggerAtr5,
-        MarketContextSnapshot,
-        ReferenceEventId,
-        ReferenceAtrRatio,
-        ReferenceAnchor,
-        ReferenceAtr5,
-        EntryLow,
-        EntryHigh,
-        StopLoss,
-        TakeProfit,
-        RewardRiskRatio,
-        Status,
-        IsActive,
-        EnteredAtTaipei,
-        EntryPrice,
-        CompletedAtTaipei,
-        Outcome,
-        ConfidenceStatus,
-        ConfidenceScore,
-        ConfidenceSampleCount,
-        EntryHitRate,
-        SourceMode
+        events.Id,
+        events.Symbol,
+        events.EvaluatedAtTaipei,
+        events.TriggerAtTaipei,
+        events.TriggerBarStartTaipei,
+        events.TriggerBarEndTaipei,
+        events.Side,
+        events.EventType,
+        events.TriggerRule,
+        events.PreviousClose,
+        events.PreviousSma76,
+        events.TriggerClose,
+        events.TriggerSma76,
+        events.TriggerSma20,
+        events.TriggerAtr5,
+        events.MarketContextSnapshot,
+        events.ReferenceEventId,
+        events.ReferenceAtrRatio,
+        events.ReferenceAnchor,
+        events.ReferenceAtr5,
+        events.EntryLow,
+        events.EntryHigh,
+        events.StopLoss,
+        events.TakeProfit,
+        events.RewardRiskRatio,
+        events.Status,
+        events.IsActive,
+        events.EnteredAtTaipei,
+        events.EntryPrice,
+        events.CompletedAtTaipei,
+        events.Outcome,
+        events.ConfidenceStatus,
+        events.ConfidenceScore,
+        events.ConfidenceSampleCount,
+        events.EntryHitRate,
+        events.RecommendationPrice,
+        events.SourceMode,
+        reference.TriggerAtTaipei,
+        reference.Side,
+        reference.TriggerClose,
+        reference.TriggerSma76,
+        reference.Status,
+        events.ExitPrice,
+        events.ProfitPoints
         """;
 }
 
@@ -829,6 +1201,7 @@ public sealed record FuturesDashboardSnapshot(
     string? Message,
     DateTimeOffset ServerTimeTaipei,
     FuturesQuoteSnapshot? Quote,
+    CurrentSmaSnapshot? CurrentSma,
     IReadOnlyList<QuoteHistoryPointSnapshot> QuoteHistory,
     IReadOnlyList<MarketContextSnapshot> MarketContexts,
     EntryRecommendationSnapshot? LatestRecommendation,
@@ -847,7 +1220,38 @@ public sealed record FuturesQuoteSnapshot(
     decimal? ComparisonBasePrice,
     DateTimeOffset? ComparisonBaseTimeTaipei);
 
+public sealed record CurrentSmaSnapshot(
+    string Symbol,
+    int IntervalMinutes,
+    DateTimeOffset BarStartTaipei,
+    DateTimeOffset BarEndTaipei,
+    decimal Close,
+    decimal? Sma20,
+    decimal? Sma76,
+    int AvailableBarCount,
+    DateTimeOffset UpdatedAtTaipei);
+
 public sealed record QuoteHistoryPointSnapshot(DateTimeOffset SampleTimeTaipei, decimal Price);
+
+public sealed record MinuteKBarsSnapshot(
+    bool IsConnected,
+    string? Message,
+    string Symbol,
+    int IntervalMinutes,
+    DateTimeOffset GeneratedAtTaipei,
+    DateTimeOffset FromTaipei,
+    DateTimeOffset ToTaipei,
+    IReadOnlyList<MinuteKBarSnapshot> Bars);
+
+public sealed record MinuteKBarSnapshot(
+    DateTimeOffset BarStartTaipei,
+    DateTimeOffset BarEndTaipei,
+    decimal Open,
+    decimal High,
+    decimal Low,
+    decimal Close,
+    int SourceCount,
+    DateTimeOffset UpdatedAtTaipei);
 
 public sealed record MarketContextSnapshot(
     string Side,
@@ -892,6 +1296,13 @@ public sealed record EntryRecommendationSnapshot(
     decimal? TriggerSma20,
     decimal? TriggerAtr5,
     long? ReferenceEventId,
+    DateTimeOffset? ReferenceEventTriggerAtTaipei,
+    string? ReferenceEventSide,
+    string? ReferenceEventSideLabel,
+    decimal? ReferenceEventTriggerClose,
+    decimal? ReferenceEventTriggerSma76,
+    string? ReferenceEventStatus,
+    string? ReferenceEventStatusLabel,
     decimal? ReferenceAtrRatio,
     decimal? EntryLow,
     decimal? EntryHigh,
@@ -903,6 +1314,8 @@ public sealed record EntryRecommendationSnapshot(
     bool IsActive,
     DateTimeOffset? EnteredAtTaipei,
     decimal? EntryPrice,
+    decimal? ExitPrice,
+    decimal? ProfitPoints,
     DateTimeOffset? CompletedAtTaipei,
     string? Outcome,
     string OutcomeLabel,
@@ -911,4 +1324,5 @@ public sealed record EntryRecommendationSnapshot(
     decimal? ConfidenceScore,
     int ConfidenceSampleCount,
     decimal? EntryHitRate,
+    decimal? RecommendationPrice,
     string SourceMode);

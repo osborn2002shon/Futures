@@ -61,7 +61,7 @@ internal sealed class StrategyTextReporter
         var path = Path.Combine(_dataDirectory, "entry_recommendation_events.txt");
         await EnsureHeaderAsync(
             path,
-            "event_id,changed_at_taipei,previous_status,status,trigger_at_taipei,side,event_type,trigger_rule,reference_event_id,reference_atr_ratio,entry_low,entry_high,stop_loss,take_profit,reward_risk_ratio,entered_at_taipei,entry_price,completed_at_taipei,outcome,confidence_status,confidence_score,confidence_sample_count,entry_hit_rate,observed_price,note",
+            "event_id,changed_at_taipei,previous_status,status,trigger_at_taipei,side,event_type,trigger_rule,reference_event_id,reference_atr_ratio,entry_low,entry_high,stop_loss,take_profit,reward_risk_ratio,entered_at_taipei,entry_price,exit_price,profit_points,completed_at_taipei,outcome,confidence_status,confidence_score,confidence_sample_count,entry_hit_rate,observed_price,note,recommendation_price",
             cancellationToken);
 
         var lines = changeArray.Select(change =>
@@ -86,6 +86,8 @@ internal sealed class StrategyTextReporter
                 FormatNullableDecimal(recommendation.RewardRiskRatio),
                 FormatNullableDateTime(recommendation.EnteredAt),
                 FormatNullableDecimal(recommendation.EntryPrice),
+                FormatNullableDecimal(recommendation.ExitPrice),
+                FormatNullableDecimal(recommendation.ProfitPoints),
                 FormatNullableDateTime(recommendation.CompletedAt),
                 Escape(recommendation.Outcome),
                 recommendation.ConfidenceStatus,
@@ -93,7 +95,8 @@ internal sealed class StrategyTextReporter
                 recommendation.ConfidenceSampleCount.ToString(CultureInfo.InvariantCulture),
                 FormatNullableDecimal(recommendation.EntryHitRate),
                 FormatNullableDecimal(change.ObservedPrice),
-                Escape(change.Note));
+                Escape(change.Note),
+                FormatNullableDecimal(recommendation.RecommendationPrice));
         });
 
         await File.AppendAllLinesAsync(path, lines, Encoding.UTF8, cancellationToken);

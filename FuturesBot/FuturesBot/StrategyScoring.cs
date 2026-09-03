@@ -93,13 +93,13 @@ internal sealed record EntryStrategySettings(
 
 /// <summary>
 /// 15 分 K 進場策略評估器。
-/// 多方與空方各有 6 個條件：SMA76 穿越、SMA76 趨勢、SMA20 趨勢、SMA20/SMA76 相對位置、非盤整、1 分 K SMA60 過濾。
+/// 多方與空方各有 7 個條件：SMA76 穿越、SMA76 趨勢、SMA20 趨勢、15 分 K 收盤與 SMA20 相對位置、SMA20/SMA76 相對位置、非盤整、1 分 K SMA60 過濾。
 /// </summary>
 internal static class EntryStrategyEvaluator
 {
     private const string SignalType = "entry";
 
-    private const int TotalConditions = 6;
+    private const int TotalConditions = 7;
 
     /// <summary>
     /// 評估指定時間點的多方與空方進場條件。
@@ -161,7 +161,7 @@ internal static class EntryStrategyEvaluator
     }
 
     /// <summary>
-    /// 評估單一方向的 6 個條件，並整理為可寫入資料庫的策略分數。
+    /// 評估單一方向的 7 個條件，並整理為可寫入資料庫的策略分數。
     /// </summary>
     private static StrategyScore EvaluateSide(
         StrategySide side,
@@ -214,7 +214,7 @@ internal static class EntryStrategyEvaluator
 
     /// <summary>
     /// 建立多方進場條件。
-    /// 條件依序為：收盤向上穿越 SMA76、SMA76 上升、SMA20 上升、SMA20 大於 SMA76、非盤整、1 分 K 收盤大於 SMA60。
+    /// 條件依序為：收盤向上穿越 SMA76、SMA76 上升、SMA20 上升、15 分 K 收盤大於 SMA20、SMA20 大於 SMA76、非盤整、1 分 K 收盤大於 SMA60。
     /// </summary>
     private static StrategyCondition[] BuildLongConditions(
         SmaKBar current,
@@ -226,6 +226,7 @@ internal static class EntryStrategyEvaluator
         new("close_cross_above_sma76", previous?.SlowSma is not null && current.SlowSma is not null && previous.Value.Bar.Close < previous.Value.SlowSma && current.Bar.Close > current.SlowSma),
         new("sma76_gt_sma76_5_bars_ago", current.SlowSma is not null && lookback?.SlowSma is not null && current.SlowSma > lookback.Value.SlowSma),
         new("sma20_gt_sma20_5_bars_ago", current.FastSma is not null && lookback?.FastSma is not null && current.FastSma > lookback.Value.FastSma),
+        new("fifteen_min_close_gt_sma20", current.FastSma is not null && current.Bar.Close > current.FastSma),
         new("sma20_gt_sma76", current.FastSma is not null && current.SlowSma is not null && current.FastSma > current.SlowSma),
         new("not_consolidating", notConsolidating),
         new("one_min_close_gt_sma60", oneMinuteSma60.HasEnoughData && oneMinuteSma60.Close > oneMinuteSma60.Sma60)
@@ -233,7 +234,7 @@ internal static class EntryStrategyEvaluator
 
     /// <summary>
     /// 建立空方進場條件。
-    /// 條件依序為：收盤向下穿越 SMA76、SMA76 下降、SMA20 下降、SMA20 小於 SMA76、非盤整、1 分 K 收盤小於 SMA60。
+    /// 條件依序為：收盤向下穿越 SMA76、SMA76 下降、SMA20 下降、15 分 K 收盤小於 SMA20、SMA20 小於 SMA76、非盤整、1 分 K 收盤小於 SMA60。
     /// </summary>
     private static StrategyCondition[] BuildShortConditions(
         SmaKBar current,
@@ -245,6 +246,7 @@ internal static class EntryStrategyEvaluator
         new("close_cross_below_sma76", previous?.SlowSma is not null && current.SlowSma is not null && previous.Value.Bar.Close > previous.Value.SlowSma && current.Bar.Close < current.SlowSma),
         new("sma76_lt_sma76_5_bars_ago", current.SlowSma is not null && lookback?.SlowSma is not null && current.SlowSma < lookback.Value.SlowSma),
         new("sma20_lt_sma20_5_bars_ago", current.FastSma is not null && lookback?.FastSma is not null && current.FastSma < lookback.Value.FastSma),
+        new("fifteen_min_close_lt_sma20", current.FastSma is not null && current.Bar.Close < current.FastSma),
         new("sma20_lt_sma76", current.FastSma is not null && current.SlowSma is not null && current.FastSma < current.SlowSma),
         new("not_consolidating", notConsolidating),
         new("one_min_close_lt_sma60", oneMinuteSma60.HasEnoughData && oneMinuteSma60.Close < oneMinuteSma60.Sma60)

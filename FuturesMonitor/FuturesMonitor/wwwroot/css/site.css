@@ -281,7 +281,7 @@ body::after {
 }
 
 .quote-grid {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   padding-top: 18px;
 }
 
@@ -451,7 +451,7 @@ body::after {
 
 .event-meta-grid {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
 }
 
 .event-meta-grid > div {
@@ -879,6 +879,16 @@ body::after {
   letter-spacing: 0;
   text-shadow: 0 0 18px rgba(49, 215, 255, .18);
   word-break: break-word;
+}
+
+.history-reference {
+  display: block;
+  min-height: 18px;
+  color: #a7b6bf;
+  font-size: .78rem;
+  font-weight: 780;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
 }
 
 .history-metrics {

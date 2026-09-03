@@ -29,6 +29,7 @@ internal sealed partial class FuturesSqlStore
                     TriggerSma76 decimal(18,4) NOT NULL,
                     TriggerSma20 decimal(18,4) NULL,
                     TriggerAtr5 decimal(18,4) NULL,
+                    RecommendationPrice decimal(18,4) NULL,
                     MarketContextSnapshot nvarchar(max) NOT NULL,
                     ReferenceEventId bigint NULL,
                     ReferenceAtrRatio decimal(18,4) NULL,
@@ -43,6 +44,8 @@ internal sealed partial class FuturesSqlStore
                     IsActive bit NOT NULL,
                     EnteredAtTaipei datetimeoffset(0) NULL,
                     EntryPrice decimal(18,4) NULL,
+                    ExitPrice decimal(18,4) NULL,
+                    ProfitPoints decimal(18,4) NULL,
                     CompletedAtTaipei datetimeoffset(0) NULL,
                     Outcome nvarchar(32) NULL,
                     ConfidenceStatus nvarchar(32) NOT NULL,
@@ -54,6 +57,40 @@ internal sealed partial class FuturesSqlStore
                     ModifiedAtUtc datetime2(0) NOT NULL CONSTRAINT DF_EntryRecommendationEvents_ModifiedAtUtc DEFAULT SYSUTCDATETIME()
                 );
             END;
+
+            IF COL_LENGTH(N'dbo.EntryRecommendationEvents', N'RecommendationPrice') IS NULL
+            BEGIN
+                ALTER TABLE dbo.EntryRecommendationEvents
+                    ADD RecommendationPrice decimal(18,4) NULL;
+            END;
+
+            IF COL_LENGTH(N'dbo.EntryRecommendationEvents', N'ExitPrice') IS NULL
+            BEGIN
+                ALTER TABLE dbo.EntryRecommendationEvents
+                    ADD ExitPrice decimal(18,4) NULL;
+            END;
+
+            IF COL_LENGTH(N'dbo.EntryRecommendationEvents', N'ProfitPoints') IS NULL
+            BEGIN
+                ALTER TABLE dbo.EntryRecommendationEvents
+                    ADD ProfitPoints decimal(18,4) NULL;
+            END;
+            """,
+            """
+
+            UPDATE events
+            SET RecommendationPrice = backfill.Price,
+                ModifiedAtUtc = SYSUTCDATETIME()
+            FROM dbo.EntryRecommendationEvents AS events
+            CROSS APPLY
+            (
+                SELECT TOP (1) ticks.Price
+                FROM dbo.FuturesTicks AS ticks
+                WHERE ticks.Symbol = events.Symbol
+                  AND ticks.CapturedAtTaipei <= events.EvaluatedAtTaipei
+                ORDER BY ticks.CapturedAtTaipei DESC, ticks.Id DESC
+            ) AS backfill
+            WHERE events.RecommendationPrice IS NULL;
 
             IF NOT EXISTS
             (
@@ -121,6 +158,15 @@ internal sealed partial class FuturesSqlStore
                 CREATE INDEX IX_EntryRecommendationStatusHistory_Event_Changed
                     ON dbo.EntryRecommendationStatusHistory(RecommendationEventId, ChangedAtTaipei, Id);
             END;
+
+            UPDATE history
+            SET ObservedPrice = events.RecommendationPrice
+            FROM dbo.EntryRecommendationStatusHistory AS history
+            INNER JOIN dbo.EntryRecommendationEvents AS events
+                ON events.Id = history.RecommendationEventId
+            WHERE history.PreviousStatus IS NULL
+              AND history.ObservedPrice IS NULL
+              AND events.RecommendationPrice IS NOT NULL;
             """
         };
 
@@ -277,16 +323,16 @@ internal sealed partial class FuturesSqlStore
                  Side, EventType, TriggerRule, PreviousClose, PreviousSma76, TriggerClose, TriggerSma76,
                  TriggerSma20, TriggerAtr5, MarketContextSnapshot, ReferenceEventId, ReferenceAtrRatio,
                  ReferenceAnchor, ReferenceAtr5, EntryLow, EntryHigh, StopLoss, TakeProfit, RewardRiskRatio,
-                 Status, IsActive, EnteredAtTaipei, EntryPrice, CompletedAtTaipei, Outcome,
-                 ConfidenceStatus, ConfidenceScore, ConfidenceSampleCount, EntryHitRate, SourceMode)
+                 Status, IsActive, EnteredAtTaipei, EntryPrice, ExitPrice, ProfitPoints, CompletedAtTaipei, Outcome,
+                 ConfidenceStatus, ConfidenceScore, ConfidenceSampleCount, EntryHitRate, RecommendationPrice, SourceMode)
             OUTPUT INSERTED.Id
             SELECT
                 @symbol, @evaluatedAtTaipei, @triggerAtTaipei, @triggerBarStartTaipei, @triggerBarEndTaipei,
                 @side, @eventType, @triggerRule, @previousClose, @previousSma76, @triggerClose, @triggerSma76,
                 @triggerSma20, @triggerAtr5, @marketContextSnapshot, @referenceEventId, @referenceAtrRatio,
                 @referenceAnchor, @referenceAtr5, @entryLow, @entryHigh, @stopLoss, @takeProfit, @rewardRiskRatio,
-                @status, @isActive, @enteredAtTaipei, @entryPrice, @completedAtTaipei, @outcome,
-                @confidenceStatus, @confidenceScore, @confidenceSampleCount, @entryHitRate, @sourceMode
+                @status, @isActive, @enteredAtTaipei, @entryPrice, @exitPrice, @profitPoints, @completedAtTaipei, @outcome,
+                @confidenceStatus, @confidenceScore, @confidenceSampleCount, @entryHitRate, @recommendationPrice, @sourceMode
             WHERE NOT EXISTS
             (
                 SELECT 1
@@ -314,12 +360,12 @@ internal sealed partial class FuturesSqlStore
             changedAt,
             null,
             stored.Status,
-            null,
+            stored.RecommendationPrice,
             note,
             cancellationToken);
         transaction.Commit();
 
-        return new RecommendationChange(stored, null, changedAt, null, note);
+        return new RecommendationChange(stored, null, changedAt, stored.RecommendationPrice, note);
     }
 
     public async Task<RecommendationChange?> TryTransitionRecommendationAsync(
@@ -338,8 +384,12 @@ internal sealed partial class FuturesSqlStore
             UPDATE dbo.EntryRecommendationEvents WITH (UPDLOCK)
             SET Status = @newStatus,
                 IsActive = @isActive,
+                StopLoss = @stopLoss,
+                TakeProfit = @takeProfit,
                 EnteredAtTaipei = @enteredAtTaipei,
                 EntryPrice = @entryPrice,
+                ExitPrice = @exitPrice,
+                ProfitPoints = @profitPoints,
                 CompletedAtTaipei = @completedAtTaipei,
                 Outcome = @outcome,
                 ModifiedAtUtc = SYSUTCDATETIME()
@@ -350,8 +400,12 @@ internal sealed partial class FuturesSqlStore
         AddStringParameter(command, "@expectedStatus", recommendation.Status, 64);
         AddStringParameter(command, "@newStatus", updated.Status, 64);
         command.Parameters.Add("@isActive", SqlDbType.Bit).Value = updated.IsActive;
+        AddNullableDecimalParameter(command, "@stopLoss", updated.StopLoss);
+        AddNullableDecimalParameter(command, "@takeProfit", updated.TakeProfit);
         AddNullableDateTimeOffsetParameter(command, "@enteredAtTaipei", updated.EnteredAt);
         AddNullableDecimalParameter(command, "@entryPrice", updated.EntryPrice);
+        AddNullableDecimalParameter(command, "@exitPrice", updated.ExitPrice);
+        AddNullableDecimalParameter(command, "@profitPoints", updated.ProfitPoints);
         AddNullableDateTimeOffsetParameter(command, "@completedAtTaipei", updated.CompletedAt);
         AddNullableStringParameter(command, "@outcome", updated.Outcome, 32);
 
@@ -379,6 +433,97 @@ internal sealed partial class FuturesSqlStore
             transition.ChangedAt,
             transition.ObservedPrice,
             transition.Note);
+    }
+
+    public async Task<int> RewriteRecommendationEventsAsync(
+        IReadOnlyList<RecommendationReplayResult> results,
+        CancellationToken cancellationToken)
+    {
+        if (results.Count == 0)
+        {
+            return 0;
+        }
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        using var transaction = connection.BeginTransaction(IsolationLevel.Serializable);
+
+        using (var clearActiveCommand = connection.CreateCommand())
+        {
+            clearActiveCommand.Transaction = transaction;
+            clearActiveCommand.CommandText = """
+                UPDATE dbo.EntryRecommendationEvents WITH (UPDLOCK)
+                SET IsActive = 0,
+                    ModifiedAtUtc = SYSUTCDATETIME()
+                WHERE Symbol = @symbol;
+                """;
+            AddStringParameter(clearActiveCommand, "@symbol", _symbol, 32);
+            await clearActiveCommand.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        var updated = 0;
+        foreach (var result in results)
+        {
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                UPDATE dbo.EntryRecommendationEvents WITH (UPDLOCK)
+                SET ReferenceEventId = @referenceEventId,
+                    ReferenceAtrRatio = @referenceAtrRatio,
+                    ReferenceAnchor = @referenceAnchor,
+                    ReferenceAtr5 = @referenceAtr5,
+                    EntryLow = @entryLow,
+                    EntryHigh = @entryHigh,
+                    StopLoss = @stopLoss,
+                    TakeProfit = @takeProfit,
+                    RewardRiskRatio = @rewardRiskRatio,
+                    Status = @status,
+                    IsActive = @isActive,
+                    EnteredAtTaipei = @enteredAtTaipei,
+                    EntryPrice = @entryPrice,
+                    ExitPrice = @exitPrice,
+                    ProfitPoints = @profitPoints,
+                    CompletedAtTaipei = @completedAtTaipei,
+                    Outcome = @outcome,
+                    ConfidenceStatus = @confidenceStatus,
+                    ConfidenceScore = @confidenceScore,
+                    ConfidenceSampleCount = @confidenceSampleCount,
+                    EntryHitRate = @entryHitRate,
+                    SourceMode = @sourceMode,
+                    ModifiedAtUtc = SYSUTCDATETIME()
+                WHERE Id = @id
+                  AND Symbol = @symbol;
+                """;
+            command.Parameters.Add("@id", SqlDbType.BigInt).Value = result.Event.Id;
+            AddEntryRecommendationParameters(command, result.Event);
+            updated += await command.ExecuteNonQueryAsync(cancellationToken);
+
+            using var deleteHistoryCommand = connection.CreateCommand();
+            deleteHistoryCommand.Transaction = transaction;
+            deleteHistoryCommand.CommandText = """
+                DELETE FROM dbo.EntryRecommendationStatusHistory
+                WHERE RecommendationEventId = @recommendationEventId;
+                """;
+            deleteHistoryCommand.Parameters.Add("@recommendationEventId", SqlDbType.BigInt).Value = result.Event.Id;
+            await deleteHistoryCommand.ExecuteNonQueryAsync(cancellationToken);
+
+            foreach (var history in result.StatusHistory)
+            {
+                await InsertStatusHistoryAsync(
+                    connection,
+                    transaction,
+                    result.Event.Id,
+                    history.ChangedAt,
+                    history.PreviousStatus,
+                    history.NewStatus,
+                    history.ObservedPrice,
+                    history.Note,
+                    cancellationToken);
+            }
+        }
+
+        transaction.Commit();
+        return updated;
     }
 
     private static async Task InsertStatusHistoryAsync(
@@ -442,12 +587,15 @@ internal sealed partial class FuturesSqlStore
         command.Parameters.Add("@isActive", SqlDbType.Bit).Value = recommendation.IsActive;
         AddNullableDateTimeOffsetParameter(command, "@enteredAtTaipei", recommendation.EnteredAt);
         AddNullableDecimalParameter(command, "@entryPrice", recommendation.EntryPrice);
+        AddNullableDecimalParameter(command, "@exitPrice", recommendation.ExitPrice);
+        AddNullableDecimalParameter(command, "@profitPoints", recommendation.ProfitPoints);
         AddNullableDateTimeOffsetParameter(command, "@completedAtTaipei", recommendation.CompletedAt);
         AddNullableStringParameter(command, "@outcome", recommendation.Outcome, 32);
         AddStringParameter(command, "@confidenceStatus", recommendation.ConfidenceStatus, 32);
         AddNullableDecimalParameter(command, "@confidenceScore", recommendation.ConfidenceScore);
         command.Parameters.Add("@confidenceSampleCount", SqlDbType.Int).Value = recommendation.ConfidenceSampleCount;
         AddNullableDecimalParameter(command, "@entryHitRate", recommendation.EntryHitRate);
+        AddNullableDecimalParameter(command, "@recommendationPrice", recommendation.RecommendationPrice);
         AddStringParameter(command, "@sourceMode", recommendation.SourceMode, 16);
     }
 
@@ -491,13 +639,16 @@ internal sealed partial class FuturesSqlStore
             reader.GetBoolean(26),
             await reader.IsDBNullAsync(27, cancellationToken) ? null : reader.GetDateTimeOffset(27),
             await reader.IsDBNullAsync(28, cancellationToken) ? null : reader.GetDecimal(28),
+            await reader.IsDBNullAsync(37, cancellationToken) ? null : reader.GetDecimal(37),
+            await reader.IsDBNullAsync(38, cancellationToken) ? null : reader.GetDecimal(38),
             await reader.IsDBNullAsync(29, cancellationToken) ? null : reader.GetDateTimeOffset(29),
             await reader.IsDBNullAsync(30, cancellationToken) ? null : reader.GetString(30),
             reader.GetString(31),
             await reader.IsDBNullAsync(32, cancellationToken) ? null : reader.GetDecimal(32),
             reader.GetInt32(33),
             await reader.IsDBNullAsync(34, cancellationToken) ? null : reader.GetDecimal(34),
-            reader.GetString(35));
+            await reader.IsDBNullAsync(35, cancellationToken) ? null : reader.GetDecimal(35),
+            reader.GetString(36));
     }
 
     private const string EntryRecommendationSelectColumns = """
@@ -536,6 +687,9 @@ internal sealed partial class FuturesSqlStore
         ConfidenceScore,
         ConfidenceSampleCount,
         EntryHitRate,
-        SourceMode
+        RecommendationPrice,
+        SourceMode,
+        ExitPrice,
+        ProfitPoints
         """;
 }

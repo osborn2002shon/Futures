@@ -1,4 +1,4 @@
-using FuturesMonitor.Services;
+using Futures.ReadModel;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -26,6 +26,24 @@ app.UseAuthorization();
 
 app.MapGet("/api/dashboard", async (FuturesDashboardService dashboardService, CancellationToken cancellationToken) =>
     Results.Ok(await dashboardService.GetSnapshotAsync(cancellationToken)));
+
+app.MapGet("/api/minute-k-bars", async (
+    int? intervalMinutes,
+    FuturesDashboardService dashboardService,
+    CancellationToken cancellationToken) =>
+{
+    var interval = intervalMinutes ?? 1;
+    if (!FuturesDashboardService.SupportedMinuteKIntervals.Contains(interval))
+    {
+        return Results.BadRequest(new
+        {
+            message = "Unsupported intervalMinutes. Supported values are 1, 5, 15, 30, and 60.",
+            supportedIntervalMinutes = FuturesDashboardService.SupportedMinuteKIntervals
+        });
+    }
+
+    return Results.Ok(await dashboardService.GetMinuteKBarsAsync(interval, cancellationToken));
+});
 
 app.MapRazorPages();
 

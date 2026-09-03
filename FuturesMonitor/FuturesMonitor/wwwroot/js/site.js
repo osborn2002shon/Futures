@@ -30,6 +30,8 @@
     comparisonBase: root.querySelector('[data-field="comparisonBase"]'),
     quoteChart: root.querySelector('[data-field="quoteChart"]'),
     symbol: root.querySelector('[data-field="symbol"]'),
+    sma20: root.querySelector('[data-field="sma20"]'),
+    sma76: root.querySelector('[data-field="sma76"]'),
     sampleTime: root.querySelector('.quote-panel [data-field="sampleTime"]'),
     capturedAt: root.querySelector('[data-field="capturedAt"]'),
     age: root.querySelector('[data-field="age"]'),
@@ -46,6 +48,9 @@
     referenceEvent: root.querySelector('[data-field="referenceEvent"]'),
     atrRatio: root.querySelector('[data-field="atrRatio"]'),
     enteredPrice: root.querySelector('[data-field="enteredPrice"]'),
+    exitPrice: root.querySelector('[data-field="exitPrice"]'),
+    profitPoints: root.querySelector('[data-field="profitPoints"]'),
+    recommendationPrice: root.querySelector('[data-field="recommendationPrice"]'),
     confidence: root.querySelector('[data-field="confidence"]'),
     entryHitRate: root.querySelector('[data-field="entryHitRate"]'),
     outcome: root.querySelector('[data-field="outcome"]'),
@@ -100,6 +105,7 @@
       resetQuote();
     }
 
+    renderCurrentSma(snapshot.currentSma || null);
     quoteHistory = snapshot.quoteHistory || [];
     drawQuoteChart(quoteHistory);
     renderRecommendation(snapshot.latestRecommendation || null);
@@ -133,6 +139,31 @@
     fields.sampleTime.textContent = "--";
     fields.capturedAt.textContent = "--";
     fields.age.textContent = "--";
+  }
+
+  function renderCurrentSma(currentSma) {
+    if (!currentSma) {
+      setSmaField(fields.sma20, null, "");
+      setSmaField(fields.sma76, null, "");
+      return;
+    }
+
+    const detail = `15分K ${formatDate(currentSma.barEndTaipei)} / Close ${formatPoint(currentSma.close)} / ${currentSma.availableBarCount} bars`;
+    setSmaField(fields.sma20, currentSma.sma20, detail);
+    setSmaField(fields.sma76, currentSma.sma76, detail);
+  }
+
+  function setSmaField(element, value, title) {
+    if (!element) {
+      return;
+    }
+
+    element.textContent = formatPoint(value);
+    if (title) {
+      element.title = title;
+    } else {
+      element.removeAttribute("title");
+    }
   }
 
   function drawQuoteChart(points) {
@@ -318,8 +349,12 @@
       fields.takeProfit.textContent = "--";
       fields.rewardRisk.textContent = "--";
       fields.referenceEvent.textContent = "--";
+      fields.referenceEvent.removeAttribute("title");
       fields.atrRatio.textContent = "--";
       fields.enteredPrice.textContent = "--";
+      fields.exitPrice.textContent = "--";
+      fields.profitPoints.textContent = "--";
+      fields.recommendationPrice.textContent = "--";
       fields.confidence.textContent = "--";
       fields.entryHitRate.textContent = "--";
       fields.outcome.textContent = "--";
@@ -340,15 +375,31 @@
     fields.rewardRisk.textContent = recommendation.rewardRiskRatio === null || recommendation.rewardRiskRatio === undefined
       ? "--"
       : `${numberFormatter.format(recommendation.rewardRiskRatio)} R`;
-    fields.referenceEvent.textContent = recommendation.referenceEventId
-      ? `#${recommendation.referenceEventId}`
-      : "--";
+    fields.referenceEvent.textContent = formatReferenceEvent(recommendation);
+    const referenceTitle = formatReferenceEventTitle(recommendation);
+    if (referenceTitle) {
+      fields.referenceEvent.title = referenceTitle;
+    } else {
+      fields.referenceEvent.removeAttribute("title");
+    }
     fields.atrRatio.textContent = recommendation.referenceAtrRatio === null || recommendation.referenceAtrRatio === undefined
       ? "--"
       : numberFormatter.format(recommendation.referenceAtrRatio);
     fields.enteredPrice.textContent = recommendation.enteredAtTaipei
       ? `${formatPoint(recommendation.entryPrice)} · ${formatDate(recommendation.enteredAtTaipei)}`
       : "--";
+    if (
+      recommendation.entryPrice !== null
+      && recommendation.entryPrice !== undefined
+      && !recommendation.enteredAtTaipei
+    ) {
+      fields.enteredPrice.textContent = formatPoint(recommendation.entryPrice);
+    }
+    fields.exitPrice.textContent = recommendation.completedAtTaipei
+      ? `${formatPoint(recommendation.exitPrice)} / ${formatDate(recommendation.completedAtTaipei)}`
+      : "--";
+    fields.profitPoints.textContent = formatSignedPoint(recommendation.profitPoints);
+    fields.recommendationPrice.textContent = formatPoint(recommendation.recommendationPrice);
     fields.confidence.textContent = formatConfidence(recommendation);
     fields.entryHitRate.textContent = formatPercentRatio(recommendation.entryHitRate);
     fields.outcome.textContent = recommendation.outcomeLabel || "--";
@@ -411,29 +462,38 @@
     const time = document.createElement("span");
     const status = document.createElement("strong");
     const range = document.createElement("div");
+    const reference = document.createElement("small");
     const metrics = document.createElement("div");
     const statusClass = getRecommendationStatusClass(recommendation.status);
 
+    row.dataset.eventId = String(recommendation.id);
     row.className = `history-row history-row-${recommendation.side || "unknown"} ${statusClass}`;
     header.className = "history-row-header";
     time.className = "history-time";
     status.className = `recommendation-status ${statusClass}`;
     range.className = "history-entry-range";
+    reference.className = "history-reference";
     metrics.className = "history-metrics";
     time.textContent = formatDate(recommendation.triggerAtTaipei);
     time.title = recommendation.triggerRuleLabel;
     status.textContent = recommendation.statusLabel;
     range.textContent = formatRange(recommendation.entryLow, recommendation.entryHigh);
+    reference.textContent = `參考 ${formatReferenceEvent(recommendation)}`;
+    reference.title = formatReferenceEventTitle(recommendation) || "";
     metrics.append(
       createHistoryMetric("停損", formatPoint(recommendation.stopLoss)),
       createHistoryMetric("停利", formatPoint(recommendation.takeProfit)),
+      createHistoryMetric("入場", formatPoint(recommendation.entryPrice)),
+      createHistoryMetric("出場", formatPoint(recommendation.exitPrice)),
+      createHistoryMetric("點數", formatSignedPoint(recommendation.profitPoints)),
+      createHistoryMetric("建議點數", formatPoint(recommendation.recommendationPrice)),
       createHistoryMetric("R/R", formatPoint(recommendation.rewardRiskRatio)),
       createHistoryMetric("結果", recommendation.outcomeLabel || "--"),
       createHistoryMetric("信心", formatConfidence(recommendation))
     );
 
     header.append(time, status);
-    row.append(header, range, metrics);
+    row.append(header, range, reference, metrics);
     return row;
   }
 
@@ -560,6 +620,56 @@
       : `${percentFormatter.format(Number(value) * 100)}%`;
   }
 
+  function formatReferenceEvent(recommendation) {
+    if (!recommendation.referenceEventId) {
+      return "--";
+    }
+
+    const parts = [`#${recommendation.referenceEventId}`];
+    if (recommendation.referenceEventTriggerAtTaipei) {
+      parts.push(formatDate(recommendation.referenceEventTriggerAtTaipei));
+    }
+
+    if (recommendation.referenceEventSideLabel) {
+      parts.push(recommendation.referenceEventSideLabel);
+    }
+
+    if (recommendation.referenceEventTriggerClose !== null && recommendation.referenceEventTriggerClose !== undefined) {
+      parts.push(`收 ${formatPoint(recommendation.referenceEventTriggerClose)}`);
+    }
+
+    return parts.join(" · ");
+  }
+
+  function formatReferenceEventTitle(recommendation) {
+    if (!recommendation.referenceEventId) {
+      return "";
+    }
+
+    const parts = [`參考事件 #${recommendation.referenceEventId}`];
+    if (recommendation.referenceEventTriggerAtTaipei) {
+      parts.push(`觸發 ${formatDate(recommendation.referenceEventTriggerAtTaipei)}`);
+    }
+
+    if (recommendation.referenceEventSideLabel) {
+      parts.push(`方向 ${recommendation.referenceEventSideLabel}`);
+    }
+
+    if (recommendation.referenceEventTriggerClose !== null && recommendation.referenceEventTriggerClose !== undefined) {
+      parts.push(`收盤 ${formatPoint(recommendation.referenceEventTriggerClose)}`);
+    }
+
+    if (recommendation.referenceEventTriggerSma76 !== null && recommendation.referenceEventTriggerSma76 !== undefined) {
+      parts.push(`SMA76 ${formatPoint(recommendation.referenceEventTriggerSma76)}`);
+    }
+
+    if (recommendation.referenceEventStatusLabel) {
+      parts.push(`狀態 ${recommendation.referenceEventStatusLabel}`);
+    }
+
+    return parts.join(" | ");
+  }
+
   function setConnection(state, text) {
     fields.connection.classList.remove("is-online", "is-warning", "is-error");
     fields.connection.classList.add(`is-${state}`);
@@ -601,6 +711,16 @@
 
   function formatPoint(value) {
     return value === null || value === undefined ? "--" : numberFormatter.format(value);
+  }
+
+  function formatSignedPoint(value) {
+    if (value === null || value === undefined) {
+      return "--";
+    }
+
+    const numeric = Number(value);
+    const sign = numeric > 0 ? "+" : "";
+    return `${sign}${numberFormatter.format(numeric)}`;
   }
 
   function formatRange(low, high) {

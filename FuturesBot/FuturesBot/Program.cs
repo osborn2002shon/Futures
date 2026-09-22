@@ -340,24 +340,19 @@ static async Task TryEvaluateEntryStrategyAsync(
             {
                 shouldInsertRecommendation = false;
             }
-            else if (active.Status == EntryRecommendationStatuses.WaitingEntry
-                     && active.Side != trigger.Side)
-            {
-                var cancellation = RecommendationLifecycleEvaluator.CancelForOppositeTrigger(active, trigger);
-                var cancelledChange = await store.TryTransitionRecommendationAsync(active, cancellation, cancellationToken);
-                if (cancelledChange is not null)
-                {
-                    changes.Add(cancelledChange);
-                    active = null;
-                }
-                else
-                {
-                    active = await store.LoadActiveRecommendationEventAsync(cancellationToken);
-                }
-            }
             else
             {
-                draft = EntryRecommendationPriceCalculator.Suppressed(confidence);
+                active = await CloseActiveRecommendationForReplacementAsync(
+                    active,
+                    trigger,
+                    point.Price,
+                    store,
+                    changes,
+                    cancellationToken);
+                if (active is not null)
+                {
+                    draft = EntryRecommendationPriceCalculator.Suppressed(confidence);
+                }
             }
         }
 
@@ -435,6 +430,29 @@ static async Task<EntryRecommendationEvent?> ApplyLifecycleTransitionsAsync(
     return active;
 }
 
+static async Task<EntryRecommendationEvent?> CloseActiveRecommendationForReplacementAsync(
+    EntryRecommendationEvent active,
+    Sma76Trigger replacementTrigger,
+    decimal replacementPrice,
+    FuturesSqlStore store,
+    ICollection<RecommendationChange> changes,
+    CancellationToken cancellationToken)
+{
+    var replacement = RecommendationLifecycleEvaluator.CloseAtPrice(
+        active,
+        replacementTrigger.EvaluatedAt,
+        replacementPrice,
+        "新 SMA76 觸發成立，先以目前價格結束原建議後改跑新建議");
+    var replacedChange = await store.TryTransitionRecommendationAsync(active, replacement, cancellationToken);
+    if (replacedChange is not null)
+    {
+        changes.Add(replacedChange);
+        return null;
+    }
+
+    return await store.LoadActiveRecommendationEventAsync(cancellationToken);
+}
+
 static bool IsSameRecommendationTrigger(EntryRecommendationEvent active, Sma76Trigger trigger) =>
     active.Symbol == trigger.Symbol
     && active.TriggerBarStart == trigger.TriggerBarStart
@@ -448,7 +466,7 @@ static string GetInitialRecommendationNote(string status) =>
         EntryRecommendationStatuses.NoReferenceEvent => "SMA76 觸發成立，但沒有合格歷史參考事件",
         EntryRecommendationStatuses.InsufficientPriceData => "SMA76 觸發成立，但 5 分 K ATR14 資料不足",
         EntryRecommendationStatuses.InvalidPriceStructure => "歷史事件存在，但映射後價格結構或報酬風險比無效",
-        EntryRecommendationStatuses.SuppressedByActiveRecommendation => "已有未結束建議，本次只保留觸發事件",
+        EntryRecommendationStatuses.SuppressedByActiveRecommendation => "轉換後仍有未結束建議，本次只保留觸發事件",
         _ => "SMA76 觸發事件建立"
     };
 

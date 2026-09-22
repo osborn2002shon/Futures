@@ -76,7 +76,7 @@ public sealed class FuturesDashboardService(IOptions<FuturesDataOptions> options
             ["expired"] = "等待入場逾期",
             ["timed_out"] = "入場後追蹤逾時",
             ["cancelled"] = "反向突破取消",
-            ["suppressed_active_recommendation"] = "已有進行中建議"
+            ["suppressed_active_recommendation"] = "轉換後仍有進行中建議"
         };
 
     private static readonly IReadOnlyDictionary<string, string> ConfidenceLabels =

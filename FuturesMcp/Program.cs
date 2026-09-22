@@ -1,4 +1,5 @@
 using Futures.ReadModel;
+using FuturesMcp;
 using FuturesMcp.Tools;
 using ModelContextProtocol.AspNetCore;
 
@@ -22,7 +23,9 @@ app.MapGet("/health", () => Results.Ok(new
 {
     service = "FuturesMcp",
     status = "ok",
-    mcpEndpoint = "/mcp"
+    mcpEndpoint = "/mcp",
+    serviceUrl = FuturesServiceInfo.ServiceUrl,
+    realTimeQuotesMessage = FuturesServiceInfo.RealTimeQuotesMessage
 }));
 
 app.MapMcp("/");

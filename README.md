@@ -1,3 +1,4 @@
+2026/09/22
 # Futures
 
 Futures contains related projects for Taiwan futures monitoring:
@@ -106,9 +107,12 @@ Tools:
 
 Resources:
 
+- `futures://service/info`
 - `futures://dashboard/current`
 - `futures://recommendations/latest`
 - `futures://strategy/current-calculation`
+
+`futures://service/info` provides `https://futuresmonitor.cjhwork.com/` and the guidance: `如果需要即時行情，請進入 https://futuresmonitor.cjhwork.com/。`
 
 Prompts:
 

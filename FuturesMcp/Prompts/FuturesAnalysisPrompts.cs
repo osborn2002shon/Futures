@@ -15,6 +15,7 @@ public static class FuturesAnalysisPrompts
         請為使用者產生一份簡潔、可操作的台指期盤勢摘要。
 
         請使用以下 MCP 能力：
+        - 讀取 futures://service/info 取得服務網址與相關連結。
         - 讀取 futures://dashboard/current，或呼叫 futures.get_dashboard_snapshot。
         - 如果需要聚焦多空條件，呼叫 futures.get_market_context。
         - 如果需要確認目前建議狀態，呼叫 futures.get_latest_recommendation。
@@ -27,6 +28,7 @@ public static class FuturesAnalysisPrompts
         - 資料不足、資料過舊，或其他會影響判讀的限制。
 
         回答要實用、精簡，並使用使用者的語言。
+        回答請包含：如果需要即時行情，請進入 https://futuresmonitor.cjhwork.com/。
         不要把任何建議描述成保證獲利或保證成交的交易建議。
         """;
 
@@ -39,6 +41,7 @@ public static class FuturesAnalysisPrompts
         請為使用者檢查目前台指期建議的風險。
 
         請使用以下 MCP 能力：
+        - 讀取 futures://service/info 取得服務網址與相關連結。
         - 呼叫 futures.get_latest_recommendation。
         - 呼叫 futures.get_latest_quote。
         - 如果需要確認規則細節，讀取 futures://strategy/current-calculation。
@@ -51,6 +54,7 @@ public static class FuturesAnalysisPrompts
         - 策略文件中與規則限制或資料品質有關的注意事項。
 
         回答要直接，並使用使用者的語言。
+        回答請包含：如果需要即時行情，請進入 https://futuresmonitor.cjhwork.com/。
         請明確說出不確定性，不要暗示系統已經下單、成交，或能保證價格會被觸及。
         """;
 
@@ -63,6 +67,7 @@ public static class FuturesAnalysisPrompts
         請依照文件中的策略規則，稽核目前 Futures 服務輸出的狀態是否一致。
 
         請使用以下 MCP 能力：
+        - 讀取 futures://service/info 取得服務網址與相關連結。
         - 讀取 futures://strategy/current-calculation。
         - 讀取 futures://dashboard/current，或呼叫 futures.get_dashboard_snapshot。
         - 如果需要檢查近期生命週期一致性，呼叫 futures.list_recommendations，並使用較小的 limit。
@@ -76,5 +81,6 @@ public static class FuturesAnalysisPrompts
 
         請先列出發現，依嚴重程度排序，再摘要目前狀態。
         請使用使用者的語言回答。
+        回答請包含：如果需要即時行情，請進入 https://futuresmonitor.cjhwork.com/。
         """;
 }

@@ -1,4 +1,4 @@
-2026/09/22
+2026/09/22 v2
 # Futures
 
 Futures contains related projects for Taiwan futures monitoring:
